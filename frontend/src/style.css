@@ -1,0 +1,187 @@
+:root {
+  --color-bg: #f6f7fb;
+  --color-card: #ffffff;
+  --color-border: #e3e6ee;
+  --color-text: #1f2330;
+  --color-muted: #6b7280;
+  --color-primary: #2563eb;
+  --color-success: #16a34a;
+  --color-warn: #d97706;
+  --color-danger: #dc2626;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  background: var(--color-bg);
+  color: var(--color-text);
+  line-height: 1.5;
+}
+
+a { color: var(--color-primary); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.layout {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.layout__nav {
+  background: #1f2937;
+  color: #fff;
+  padding: 12px 24px;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  /* 滚动时钉在视口顶部：sticky 比 fixed 简单，无需给 .layout__main
+     留 padding-top，导航高度变化也不会顶出空白。 */
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  /* 滚动后给个浅阴影，让用户感知到导航与内容分离。 */
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+}
+
+.layout__nav a { color: #d1d5db; }
+.layout__nav a.router-link-exact-active { color: #fff; font-weight: 600; }
+
+.layout__title { font-size: 18px; font-weight: 600; margin-right: 24px; }
+
+.layout__main {
+  flex: 1;
+  padding: 24px;
+  max-width: 1400px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.card {
+  /* 默认固定宽度 = 父容器宽度（block 默认 width: auto = fill parent）。
+     在首页 / 算法 / 我的数据 等页面，card 内容通常比父容器窄，让它填满
+     父容器即可，左右到屏幕边缘的距离与父容器居中后保持一致。*/
+  background: var(--color-card);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+  box-sizing: border-box;
+}
+
+/* 仅任务列表页使用：card 宽度策略 = max(父容器宽度, 子内容自然宽度)。
+   - min-width: 100%：内容没溢出时，card 填满父容器。
+   - width: max-content：当子内容（一般是宽表）宽于父容器时，card 向右
+     延伸以包裹子内容，不裁切、不出现横向滚动条，确保"详情/编辑/删除"
+     等最右列仍在 card 边界内。
+   极端宽屏下若 card 比 viewport 还宽，body 会横向滚动；如要禁止，
+   在 body 上加 overflow-x: hidden 即可（代价是 card 右侧会被裁掉）。*/
+.card--grow {
+  width: max-content;
+  min-width: 100%;
+}
+
+/* 表格在 .card--grow 里不要写死 width: 100%。否则会和 max-content 形成
+   循环依赖：table 100% 跟着 card 走，card max-content 又按 table 算，
+   浏览器在某些场景下算出的 card 宽度偏小，导致列内容溢出。
+   改成 auto 后，表格按自身内容决定宽度，card 自然撑到那个宽度。*/
+.card--grow table {
+  width: auto;
+}
+
+.card__title {
+  margin: 0 0 12px 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: #e5e7eb;
+  color: var(--color-text);
+}
+.badge--local { background: #dcfce7; color: #166534; }
+.badge--gee   { background: #dbeafe; color: #1e40af; }
+
+.button {
+  background: var(--color-primary);
+  color: #fff;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.button:disabled { background: #9ca3af; cursor: not-allowed; }
+
+.input, .textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  font-size: 14px;
+  font-family: inherit;
+}
+.textarea { min-height: 64px; resize: vertical; }
+
+.form-row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.form-row label { font-weight: 500; }
+
+.progress {
+  height: 8px;
+  background: #e5e7eb;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.progress__bar {
+  height: 100%;
+  background: var(--color-primary);
+  transition: width 0.3s ease;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+table th, table td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--color-border);
+}
+table th { background: #f3f4f6; }
+
+.list__empty { color: var(--color-muted); padding: 16px 0; }
+
+/* 任务运行日志面板：模拟终端输出。 */
+.job-log {
+  margin: 0;
+  padding: 12px;
+  max-height: 420px;
+  overflow: auto;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 运行中任务行高亮（蓝色 6% 背景），让用户在导航栏切换后能快速识别当前任务。 */
+.row--running { background: rgba(37, 99, 235, 0.06); }
+
+/* 状态徽章：运行中加脉冲动画；完成 / 失败 仅给色块（不改 text-size）。 */
+.badge--running { background: #dbeafe; color: #1e40af; }
+.badge--ok      { background: #dcfce7; color: #166534; }
+.badge--danger  { background: #fee2e2; color: #991b1b; }
+.badge--pulse   { animation: badge-pulse 1.5s ease-in-out infinite; }
+@keyframes badge-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}

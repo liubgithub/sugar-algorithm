@@ -1,0 +1,90 @@
+# ============================================================
+# 甘蔗遥感算法平台 — 通用 .gitignore
+# 原则：忽略一切可由命令还原的产物（依赖、缓存、构建产物、日志），
+# 保留所有历史数据（job 任务输出、算法训练样本、SQLite 库、ROI shapefile 等）。
+# 还原命令：
+#   后端: cd backend && pip install -r requirements.txt
+#   前端: cd frontend && npm install
+# ============================================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- Node / 前端构建产物 ----------
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+frontend/.env.local
+frontend/.env.*.local
+frontend/coverage/
+
+# ---------- 后端运行时产生的开发日志 ----------
+# 注意：jobs/<UUID>/stdout.log 是任务历史输出，不要忽略（见下方"显式保留"区块）。
+backend/uvicorn.log
+
+# ---------- IDE / 编辑器 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ---------- 操作系统产物 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# ---------- Claude Code 本地会话目录（个人缓存，无须入库） ----------
+.claude/
+
+# ============================================================
+# 显式保留 —— 历史数据 / 业务真实输出
+# 这些目录即便名字命中上面的忽略规则，也必须入库。
+# ============================================================
+
+# SQLite 任务库（前端任务列表、详情都从这里读）
+!backend/data/sugarcane.db
+
+# 真实产品任务输出：每个 <UUID>/ 对应 sugarcane.db 里一条任务记录，
+# 删任何一个目录都会破坏数据完整性。前端 preview 接口就是读这里。
+!backend/data/jobs/
+!backend/data/jobs/**
+!backend/data/jobs/**/**
+
+# 算法训练样本：ROI shapefile、sample CSV、Excel 输入、掩膜 tif。
+# 这些是 yield_local / crop_classification / crop_features / crop_threshold /
+# harvest / yield_local_v2 等算法跑起来必需的输入。
+!backend/data/algorithm_data/
+!backend/data/algorithm_data/**
+!backend/data/algorithm_data/**/**
+
+# 任务运行时的 stdout.log 在 jobs/ 目录下，已通过上面的 jobs 规则一并保留。

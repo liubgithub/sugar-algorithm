@@ -1,0 +1,65 @@
+正在读取参数表: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local_v2\excel\e52b954c775a__GX_County_Sugarcane_Monthly_2020_2025_26.xlsx
+按date补齐榨季字段: crop_year=0行, season_month=545行
+
+==================== 运行设置 ====================
+参数表: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local_v2\excel\e52b954c775a__GX_County_Sugarcane_Monthly_2020_2025_26.xlsx
+目标月份: 2026-06
+目标榨季: 2026
+训练年份: 2020-2025
+允许目标榨季入训: False
+运行模式: forecast；目标榨季未入训；当前为外推模式。
+使用月份: Apr 到 Jun
+动态特征数: 16
+完整模型特征数: 41
+Ridge alpha: 0.3
+
+==================== 训练集指标 ====================
+N                 : 618
+R2                : 0.864280
+MAE               : 4.036690
+RMSE              : 6.454084
+Bias              : 0.000000
+Province_Actual   : 84.618778
+Province_Pred     : 84.667387
+Province_Error    : 0.048609
+
+目标榨季2026没有实际Yield，无法计算精度指标。
+
+==================== 折叠核对 ====================
+县级模型面积加权原始结果: 84.549276
+折叠公式面积加权原始结果: 84.549276
+折叠差值: 0.000000000000
+县级模型面积加权最终结果: 4.777034
+影像网格不一致，启用分块重投影: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local_v2\rasters\2026-6\5f103dcb45d9__本地影像输入\2026_04_temperature_2m.tif
+影像网格不一致，启用分块重投影: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local_v2\rasters\2026-6\5f103dcb45d9__本地影像输入\2026_04_total_precipitation_sum.tif
+影像网格不一致，启用分块重投影: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local_v2\rasters\2026-6\5f103dcb45d9__本地影像输入\2026_05_temperature_2m.tif
+影像网格不一致，启用分块重投影: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local_v2\rasters\2026-6\5f103dcb45d9__本地影像输入\2026_05_total_precipitation_sum.tif
+影像网格不一致，启用分块重投影: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local_v2\rasters\2026-6\5f103dcb45d9__本地影像输入\2026_06_temperature_2m.tif
+影像网格不一致，启用分块重投影: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local_v2\rasters\2026-6\5f103dcb45d9__本地影像输入\2026_06_total_precipitation_sum.tif
+影像网格不一致，启用分块重投影: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local_v2\mask\22653dfbb85e__classification_April_1.tif
+甘蔗掩膜: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local_v2\mask\22653dfbb85e__classification_April_1.tif；保留类别: 1
+参考影像大小: 28240 x 20358, block_size=512, 分块数=2240
+分块进度: 1/2240
+分块进度: 100/2240
+分块进度: 200/2240
+分块进度: 300/2240
+分块进度: 400/2240
+分块进度: 500/2240
+分块进度: 600/2240
+分块进度: 700/2240
+分块进度: 800/2240
+分块进度: 900/2240
+分块进度: 1000/2240
+分块进度: 1100/2240
+分块进度: 1200/2240
+分块进度: 1300/2240
+分块进度: 1400/2240
+分块进度: 1500/2240
+分块进度: 1600/2240
+分块进度: 1700/2240
+分块进度: 1800/2240
+分块进度: 1900/2240
+分块进度: 2000/2240
+分块进度: 2100/2240
+分块进度: 2200/2240
+分块进度: 2240/2240

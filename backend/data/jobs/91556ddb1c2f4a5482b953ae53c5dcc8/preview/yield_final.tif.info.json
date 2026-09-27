@@ -1,0 +1,41 @@
+{
+  "job_id": "91556ddb1c2f4a5482b953ae53c5dcc8",
+  "filename": "yield_final.tif",
+  "filenames": [
+    "yield_final.tif"
+  ],
+  "mosaic": false,
+  "mosaic_count": 1,
+  "schema_version": 4,
+  "type": "continuous",
+  "width": 28240,
+  "height": 20358,
+  "preview_width": 1024,
+  "preview_height": 738,
+  "bounds": [
+    [
+      104.44639943234948,
+      20.902269525478264
+    ],
+    [
+      112.05692651941007,
+      26.38864029170983
+    ]
+  ],
+  "stats": {
+    "min": 4.353222370147705,
+    "max": 5.22639799118042,
+    "mean": 4.7265944480896,
+    "std": 0.07689836621284485,
+    "p2": 4.503389663696289,
+    "p98": 4.874716548919678,
+    "nodata_count": 743447
+  },
+  "classes": null,
+  "class_metadata": null,
+  "cmap": "viridis",
+  "nodata": -9999.0,
+  "effective_pixel_ratio": 0.01622972772696477,
+  "effective_pixel_count": 12265,
+  "total_pixel_count": 755712
+}

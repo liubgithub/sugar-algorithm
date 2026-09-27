@@ -1,0 +1,81 @@
+正在读取建模表: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local\excel\9a136e47e24b__GX_County_Sugarcane_Monthly_2020_2025_with_Yield_Area.xlsx
+已按 date 补齐缺失榨季字段: 0 行 crop_year, 1557 行 season_month。
+
+======================== 模型参数 ========================
+目标月份: 2026-06
+使用月份: Apr 到 Jun
+动态参数数: 29
+折叠截距 raw: 29.382207689283
+最终结果系数: 0.055
+
+======================== 省级折叠核对 ========================
+省级实际单产: NaN
+目标榨季县级预测面积加权: 86.159817
+折叠公式同口径还原省级: 86.159817
+折叠还原差值: -0.000000000000
+
+最终结果 = 上述原始结果 * FINAL_RESULT_SCALE
+最终省级实际结果: NaN
+最终目标榨季县级预测面积加权: 4.738790
+最终折叠公式同口径还原省级: 4.738790
+最终折叠还原差值: -0.000000000000
+全目标区县级预测面积加权: 86.159817
+全目标区折叠公式省级值: 86.159817
+最终全目标区县级预测面积加权: 4.738790
+最终全目标区折叠公式省级值: 4.738790
+参考网格: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local\rasters\2026-06\8fe9365aae1e__本地影像输入\2026_04_NDVI.tif
+参考影像大小: 28240 x 20358, block_size=512
+影像网格不一致，将按窗口重投影到参考网格: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local\rasters\2026-06\8fe9365aae1e__本地影像输入\2026_04_temperature_2m.tif
+影像网格不一致，将按窗口重投影到参考网格: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local\rasters\2026-06\8fe9365aae1e__本地影像输入\2026_04_total_precipitation_sum.tif
+影像网格不一致，将按窗口重投影到参考网格: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local\rasters\2026-06\8fe9365aae1e__本地影像输入\2026_05_temperature_2m.tif
+影像网格不一致，将按窗口重投影到参考网格: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local\rasters\2026-06\8fe9365aae1e__本地影像输入\2026_05_total_precipitation_sum.tif
+影像网格不一致，将按窗口重投影到参考网格: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local\rasters\2026-06\8fe9365aae1e__本地影像输入\2026_06_temperature_2m.tif
+影像网格不一致，将按窗口重投影到参考网格: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local\rasters\2026-06\8fe9365aae1e__本地影像输入\2026_06_total_precipitation_sum.tif
+最终掩膜 tif: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local\mask\7197bca197c6__classification_April_1.tif
+影像网格不一致，将按窗口重投影到参考网格: D:\postgraduate_0\algorithm_review\item\backend\data\algorithm_data\yield_local\mask\7197bca197c6__classification_April_1.tif
+分块计算进度: 1/2240
+分块计算进度: 50/2240
+分块计算进度: 100/2240
+分块计算进度: 150/2240
+分块计算进度: 200/2240
+分块计算进度: 250/2240
+分块计算进度: 300/2240
+分块计算进度: 350/2240
+分块计算进度: 400/2240
+分块计算进度: 450/2240
+分块计算进度: 500/2240
+分块计算进度: 550/2240
+分块计算进度: 600/2240
+分块计算进度: 650/2240
+分块计算进度: 700/2240
+分块计算进度: 750/2240
+分块计算进度: 800/2240
+分块计算进度: 850/2240
+分块计算进度: 900/2240
+分块计算进度: 950/2240
+分块计算进度: 1000/2240
+分块计算进度: 1050/2240
+分块计算进度: 1100/2240
+分块计算进度: 1150/2240
+分块计算进度: 1200/2240
+分块计算进度: 1250/2240
+分块计算进度: 1300/2240
+分块计算进度: 1350/2240
+分块计算进度: 1400/2240
+分块计算进度: 1450/2240
+分块计算进度: 1500/2240
+分块计算进度: 1550/2240
+分块计算进度: 1600/2240
+分块计算进度: 1650/2240
+分块计算进度: 1700/2240
+分块计算进度: 1750/2240
+分块计算进度: 1800/2240
+分块计算进度: 1850/2240
+分块计算进度: 1900/2240
+分块计算进度: 1950/2240
+分块计算进度: 2000/2240
+分块计算进度: 2050/2240
+分块计算进度: 2100/2240
+分块计算进度: 2150/2240
+分块计算进度: 2200/2240
+分块计算进度: 2240/2240
