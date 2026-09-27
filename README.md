@@ -1,6 +1,6 @@
-# Sugarcane Remote Sensing Platform (Phase 1 MVP)
+# Sugarcane Remote Sensing Platform 
 
-甘蔗遥感算法 Web 平台 - 第一阶段 MVP。
+甘蔗遥感算法 Web 平台。
 
 ## 结构
 
