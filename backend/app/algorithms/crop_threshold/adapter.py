@@ -28,8 +28,17 @@ class CropThresholdAdapter(AlgorithmAdapter):
             "label": "GEE 项目 ID",
             "type": "text",
             "required": False,
-            "default": "sodium-ray-505904-i3",
-            
+            # 刻意留空，不要预填任何具体项目。ee 的项目绑定是进程全局的，
+            # 预填值会在表单一加载、用户还没点运行时就把整个后端的 EE 切走，
+            # 污染同一进程里其它算法 / 其它任务的请求。留空时算法会明确报错，
+            # 而不是猜一个项目。
+            "default": "",
+            "placeholder": "例如：my-gee-project-123456",
+            "hint": (
+                "用于 ee.Initialize(project=...)，当前 GEE 账号必须对该项目有访问权限。"
+                "如需切换项目，请先在本机执行 earthengine authenticate --force，"
+                "再回来填这里的新项目 ID。"
+            ),
         },
         {
             "key": "roi_local_path",
@@ -42,10 +51,7 @@ class CropThresholdAdapter(AlgorithmAdapter):
             "hint": (
                 "Shapefile 至少需要 .shp + .shx + .dbf 三件套同时上传，"
                 "请把所有同伴文件一起打包为 .zip 再上传；"
-                "后端会自动解压并把首个 .shp 注册为 GEE 资产。"
-                ".geojson / .json 也可直接上传；"
-                "栅格（.tif）请改用下方『研究区 GEE Asset 路径』字段，"
-                "在 GEE Code Editor 上传后填入。"
+                
             ),
         },
         {

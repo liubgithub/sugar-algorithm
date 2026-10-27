@@ -176,7 +176,9 @@ async def preview_uploaded_tif(
             # rasterio 在打不开 / 不是 GeoTIFF / 无波段时报各种错；统一兜底成 400。
             raise HTTPException(status_code=400, detail=f"TIF 解析失败：{exc}") from exc
 
-        png_path = job_dir / "preview" / f"{safe_names[0]}.png"
+        # 多文件时 PNG 写在独立的 mosaic 缓存键下（mosaic_<hash>.png），
+        # 名字并不是第一个文件的名字 —— 这里问 preview_service 要真实路径。
+        png_path = preview_service.get_mosaic_preview_path(job_id, safe_names)
         if not png_path.is_file():
             raise HTTPException(status_code=500, detail="preview not generated")
         with png_path.open("rb") as fh:

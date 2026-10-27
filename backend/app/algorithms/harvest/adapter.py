@@ -50,11 +50,15 @@ class HarvestAdapter(AlgorithmAdapter):
             "label": "GEE 项目 ID",
             "type": "text",
             "required": True,
-            "default": "sodium-ray-505904-i3",
+            # 刻意留空，不要预填任何具体项目。ee 的项目绑定是进程全局的，
+            # 预填值会在表单一加载、用户还没点运行时就把整个后端的 EE 切走，
+            # 污染同一进程里其它算法 / 其它任务的请求。
+            "default": "",
+            "placeholder": "例如：my-gee-project-123456",
             "hint": (
-                "用于 ee.Initialize(project=...)。"
-                "如需切换项目，请同时在本机执行"
-                " earthengine authenticate --force。"
+                "用于 ee.Initialize(project=...)，当前 GEE 账号必须对该项目有访问权限。"
+                "如需切换项目，请先在本机执行 earthengine authenticate --force，"
+                "再回来填这里的新项目 ID。"
             ),
         },
         {
@@ -76,13 +80,7 @@ class HarvestAdapter(AlgorithmAdapter):
             "kind": "file",
             "slot": "sugarcane_mask",
             "required": False,
-            "hint": (
-                "【二选一】首次运行可上传本地单波段 GeoTIFF（1=甘蔗、0=非甘蔗，"
-                "nodata=255 像素在后端会被忽略）；后续运行可直接从历史文件下拉框中选择。"
-                "留空时改用下方「GEE Asset 路径」（超大掩膜场景更推荐）。"
-                "掩膜范围同时作为 SAR 分析的研究区边界。"
-                "后端会按 4000×4000 像素分块读取后 mosaic 提交给 GEE。"
-            ),
+           
         },
         # 时间窗口提醒卡片 —— 由前端在用户修改年份时动态渲染。
         # 该字段不在 params 中提交，仅用于在表单里给出可视化的反馈。
@@ -102,13 +100,7 @@ class HarvestAdapter(AlgorithmAdapter):
             "default": "",
             "hint": (
                 "形如 projects/<project>/assets/<name>。"
-                "【推荐用于超大掩膜】先在 GEE Code Editor 通过 "
-                "Assets → New → Image upload 上传，再把生成的 Asset 路径填到这里。"
-                "GEE 服务端直接处理 Asset，比 client-side "
-                "`ee.Image(arr).reproject(...)` 分块快数十倍；"
-                "尤其当本地 TIFF 解压后像素 > 80 亿、tile 数 > 500 "
-                "或反复卡在「正在读取/等待 GEE 资产」进度时，"
-                "用 Asset 是必经之路。"
+                "【推荐用于超大掩膜】"
             ),
         },
     ]
@@ -120,3 +112,17 @@ class HarvestAdapter(AlgorithmAdapter):
         progress_callback: Optional[ProgressCallback] = None,
     ) -> Dict[str, Any]:
         return harvest_algorithm.run(params, job_dir, progress_callback)
+
+    def finalize(
+        self,
+        job: Dict[str, Any],
+        job_dir: str,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """拉取已完成的 GEE 结果（平台后台轮询在任务 COMPLETED 后调用）。
+
+        run() 只负责提交导出任务并立刻返回 task_id；这里负责等待资产就绪、
+        分块下载到本地并产出最终结果。这样即使 GEE 端跑十几个小时、
+        中途服务器重启，结果依然会被拉回来。
+        """
+        return harvest_algorithm.finalize(job, job_dir, progress_callback)

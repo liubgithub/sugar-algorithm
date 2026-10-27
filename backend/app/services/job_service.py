@@ -23,6 +23,14 @@ from typing import Any, Dict, Iterator, List, Optional
 from app.core.config import JOBS_DIR
 from app.services import algorithm_registry
 from app.services import preview_service
+from app.services.gee_auth import (
+    GeeAuthRequired,
+    GeeNetworkError,
+    gee_session,
+    is_auth_mismatch_error,
+    is_network_error,
+    project_for_job,
+)
 from app.storage import job_store
 
 
@@ -36,6 +44,11 @@ _last_gee_check: Dict[str, float] = {}
 # at this value to keep `GET /api/jobs/{id}` (and especially
 # `GET /api/jobs` which used to refresh every row synchronously) snappy.
 _GEE_QUERY_TIMEOUT = 12.0  # seconds
+# How long a status probe waits for the process-wide GEE lock before giving
+# up and skipping the cycle. Kept short on purpose: the probe runs on the
+# HTTP request path too, so it must never stall behind a long job — the next
+# sweep (or the front-end's next poll) retries anyway.
+_GEE_PROBE_LOCK_TIMEOUT = 2.0  # seconds
 # Single shared executor — one thread per concurrent GEE probe is plenty
 # given that calls are throttled to one per few seconds per job.
 # Bumped from 4 → 8 workers because the previous 4-thread pool kept
@@ -59,6 +72,24 @@ _GEE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 _GEE_POLLER_INTERVAL = 10.0  # seconds between background sweeps
 _GEE_POLLER_STARTED = False
 _GEE_POLLER_LOCK = threading.Lock()
+
+# Job ids whose ``finalize()`` hook is currently executing *in this process*.
+#
+# This set replaces the old "status == 'running' means a finalize is in
+# flight" heuristic, which conflated two completely different states:
+#
+#   * "running" because the **GEE task itself** is still computing — the job
+#     MUST keep being polled, otherwise it never notices the task finishing
+#     and stays stuck forever;
+#   * "running" because a **finalize()** is downloading the result — the job
+#     must NOT be polled again, otherwise we'd start a second concurrent
+#     download of the same asset.
+#
+# Tracking the in-flight finalizes in-process also means a job whose
+# finalize was interrupted by a server restart is picked up again on the
+# next sweep (it is still "running" in the DB, but not in this set).
+_FINALIZE_IN_FLIGHT: set[str] = set()
+_FINALIZE_IN_FLIGHT_LOCK = threading.Lock()
 
 # Map GEE Task state -> our internal status.
 _GEE_STATE_MAP = {
@@ -260,6 +291,83 @@ def cancel_job(job_id: str) -> Optional[str]:
     return new_status
 
 
+def retry_job(job_id: str) -> Optional[str]:
+    """Re-queue a finished-but-broken job so its result is pulled again.
+
+    A job that failed in the **finalize** stage (waiting for the GEE asset /
+    downloading the GeoTIFF) is not recoverable on its own: the poller skips
+    terminal rows, so the job would sit at "failed" forever even though GEE
+    still holds the finished asset.  This function gives the operator the
+    missing "再试一次" button.
+
+    Two shapes of failure are covered:
+
+      * **finalize failed** — the GEE task itself succeeded, so
+        ``result.metrics.asset_id`` still points at the finished asset.  We
+        flip the row back to a non-terminal status and re-dispatch the
+        adapter's ``finalize`` hook.  The resumable downloader picks up
+        the tiles it already fetched, so a retry after a flaky proxy
+        resumes instead of starting over.
+      * **the GEE task failed** — there is no asset to pull, so the
+        algorithm is re-submitted from scratch (a fresh GEE task).
+
+    Returns the new status string, or ``None`` when the job does not exist.
+    Raises ``ValueError`` when the job is in a state that cannot be retried.
+    """
+    job = job_store.get_job(job_id)
+    if job is None:
+        return None
+    status = job.get("status")
+    if status not in ("failed", "cancelled"):
+        raise ValueError(
+            f"只有失败或已取消的任务可以重试（当前状态：{status}）"
+        )
+    algorithm_id = job.get("algorithm")
+    if not algorithm_id:
+        raise ValueError("任务缺少算法标识，无法重试")
+
+    result = job.get("result") or {}
+    metrics = result.get("metrics") or {}
+
+    # --- 1) GEE 侧已经有结果：只需重新拉取 ---------------------------
+    if metrics.get("asset_id"):
+        job_store.update_job(
+            job_id,
+            status="submitted",
+            progress=0,
+            message="正在重新拉取 GEE 结果（已下载的图块会断点续传）…",
+            finished_at="",
+        )
+        # 轮询器的 finalize 保护（_FINALIZE_IN_FLIGHT）保证不会有两个
+        # 下载线程同时抢同一个资产。
+        _dispatch_finalize(job_id)
+        return "submitted"
+
+    # --- 2) GEE 任务本身就失败了：重新提交 --------------------------
+    params = job.get("params") or {}
+    job_dir = os.path.join(str(JOBS_DIR), job_id)
+    try:
+        os.makedirs(job_dir, exist_ok=True)
+    except OSError as exc:
+        raise ValueError(f"无法创建任务目录：{exc}") from exc
+    job_store.update_job(
+        job_id,
+        status="queued",
+        progress=0,
+        message="正在重新提交 GEE 任务…",
+        finished_at="",
+    )
+    _last_gee_check.pop(job_id, None)
+    thread = threading.Thread(
+        target=_run_gee,
+        args=(job_id, algorithm_id, params, job_dir),
+        name=f"gee-retry-{job_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return "queued"
+
+
 def delete_job(job_id: str) -> bool:
     """Remove a job record plus its working directory.
 
@@ -376,6 +484,14 @@ def _run_gee(job_id: str, algorithm_id: str, params: Dict[str, Any], job_dir: st
     def _on_progress(pct: int, message: str) -> None:
         job_store.update_job(job_id, status="running", progress=pct, message=message)
 
+    # Project this run belongs to. Non-GEE algorithms carry no project param;
+    # they skip the session entirely and never contend for the GEE lock.
+    session_project = (
+        params.get("gee_project_id")
+        or params.get("gee_project")
+        or os.environ.get("EE_PROJECT")
+    )
+
     started_at = _utc_now_iso()
     job_store.update_job(
         job_id, status="running", progress=0, message="提交 GEE 任务", started_at=started_at
@@ -383,7 +499,20 @@ def _run_gee(job_id: str, algorithm_id: str, params: Dict[str, Any], job_dir: st
     try:
         with _capture_job_log(job_dir):
             try:
-                result = adapter.run(params, job_dir, progress_callback=_on_progress)
+                # EE keeps ONE project binding for the whole process, shared by
+                # every thread. Without holding it for the whole run, the status
+                # poller can rebind EE to some other job's project midway
+                # through and every GEE call below goes out under the wrong
+                # project — the operator then sees a permission error naming a
+                # project they never selected, which re-authenticating cannot
+                # fix. See gee_auth.gee_session.
+                if session_project:
+                    with gee_session(session_project):
+                        result = adapter.run(
+                            params, job_dir, progress_callback=_on_progress
+                        )
+                else:
+                    result = adapter.run(params, job_dir, progress_callback=_on_progress)
             except Exception:  # noqa: BLE001
                 traceback.print_exc()
                 raise
@@ -418,11 +547,24 @@ def _run_gee(job_id: str, algorithm_id: str, params: Dict[str, Any], job_dir: st
                 result={"error": str(exc)},
             )
         else:
+            # Raw GEE permission errors name whichever project EE was bound to
+            # and append an IAM-console URL. Replace them with the Chinese
+            # guidance so the operator is pointed at the project they actually
+            # selected — and at the IAM role, which is the usual real blocker
+            # when switching to a different Google account.
+            if session_project and is_auth_mismatch_error(exc):
+                msg = str(GeeAuthRequired(session_project))
+            elif is_network_error(exc):
+                # Transport failure, not a credentials problem — say so, so
+                # nobody re-authenticates a perfectly good account.
+                msg = str(GeeNetworkError(str(exc)))
+            else:
+                msg = f"GEE 任务失败: {exc}"
             job_store.update_job(
                 job_id,
                 status="failed",
                 progress=0,
-                message=f"GEE 任务失败: {exc}",
+                message=msg,
                 result={"error": str(exc)},
                 finished_at=finished_at,
             )
@@ -475,11 +617,16 @@ def _refresh_gee_status(job: Dict[str, Any]) -> None:
     task_id = result.get("gee_task_id")
     if not task_id:
         return
-    # "running" is treated as a quiet state for polling purposes — the
-    # finalize() hook owns the job until it lands on a terminal state.
-    # Without this guard, a 30-minute finalize() (crop_features Pattern B)
-    # would be hammered by a GEE status call every 10 s for no reason.
-    if job.get("status") in ("failed", "completed", "running"):
+    if job.get("status") in ("failed", "completed", "cancelled"):
+        return
+    # A job whose finalize() is currently downloading its result must not be
+    # probed again (nor finalized twice).  Note this is NOT keyed off the
+    # "running" status: a job is also "running" while the **GEE task** is
+    # still computing, and that job absolutely has to keep being polled —
+    # that is how it ever learns the task finished.  The old
+    # `status in (..., "running")` guard froze exactly those jobs, which is
+    # why a 17-hour harvest export sat at "running" forever.
+    if _finalize_in_flight(job["job_id"]):
         return
 
     job_id = job["job_id"]
@@ -492,18 +639,13 @@ def _refresh_gee_status(job: Dict[str, Any]) -> None:
     # GEE scopes the call to whichever project EE is initialized to, and
     # we MUST stay bound to the project that owns the task. See
     # ``_query_gee_status`` for the failure mode this guards against.
-    job_params = job.get("params") or {}
-    job_project = job_params.get("gee_project_id") or job_params.get("gee_project")
-    if not job_project:
-        # Fallback: derive from the sample_asset_id / asset_id (both are
-        # ``projects/<project>/assets/<name>``). This recovers jobs that
-        # were submitted before ``params.gee_project_id`` was canonical,
-        # or jobs whose params row got corrupted.
-        for key in ("asset_id", "sample_asset_id"):
-            ref = (result.get("metrics") or {}).get(key) or ""
-            if ref.startswith("projects/") and "/assets/" in ref:
-                job_project = ref.split("/")[1]
-                break
+    # Single source of truth for "which project owns this task" — the same
+    # helper the finalize hooks use to rebind EE. Letting the probe and the
+    # download resolve the project independently is how they ended up
+    # disagreeing: the probe ran against one project while finalize's GEE
+    # calls went out under another, and the user saw a permission error
+    # naming a project they never selected.
+    job_project = project_for_job(job)
 
     mapped, error_msg = _query_gee_status(task_id, project=job_project)
     if mapped is None:
@@ -536,6 +678,40 @@ def _refresh_gee_status(job: Dict[str, Any]) -> None:
         job["status"] = mapped
 
 
+def _finalize_error_message(exc: BaseException, project: Optional[str]) -> str:
+    """Turn a finalize failure into something worth showing a user.
+
+    Raw GEE permission errors are swapped for the Chinese re-auth guidance.
+    They name whichever project EE was bound to at the time and append an
+    IAM-console URL — even though the finalize hooks now rebind EE to the
+    job's own project first, a foreign call can still surface from
+    earthengine-api / geemap internals, and dumping its English text into
+    the failed-job card sends the operator to the wrong console.
+    """
+    if project and is_auth_mismatch_error(exc):
+        return str(GeeAuthRequired(project))
+    if is_network_error(exc):
+        # The download died on the transport, not on the credentials.  Say so
+        # plainly — the resumable downloader keeps the tiles it already got,
+        # so the fix is "make the network work and retry", not "re-auth".
+        return str(GeeNetworkError(str(exc)))
+    return f"finalize 失败: {exc}"
+
+
+def _mark_finalize_failed(job_id: str, message: str) -> None:
+    """Best-effort write of a terminal `failed` status from the poller."""
+    try:
+        job_store.update_job(job_id, status="failed", message=message)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
+def _finalize_in_flight(job_id: str) -> bool:
+    """Is a ``finalize()`` currently running for this job in this process?"""
+    with _FINALIZE_IN_FLIGHT_LOCK:
+        return job_id in _FINALIZE_IN_FLIGHT
+
+
 def _dispatch_finalize(job_id: str) -> None:
     """Drive a job from a non-terminal state to ``completed`` via the adapter.
 
@@ -543,32 +719,36 @@ def _dispatch_finalize(job_id: str) -> None:
     COMPLETED. Two patterns are supported:
 
       * **Pattern B with finalize()**: the adapter has a ``finalize`` hook
-        (e.g. ``crop_features``); we flip status to ``running``, run the
-        hook (which waits for the Asset and downloads the CSV), then write
-        the new ``result`` payload to the DB and flip status to
-        ``completed``.
+        (e.g. ``crop_features``, ``crop_classification``, ``harvest``); we
+        flip status to ``running``, run the hook (which waits for the Asset
+        and downloads the result), then write the new ``result`` payload to
+        the DB and flip status to ``completed``.
 
-      * **Pattern B without finalize()**: the adapter has no override
-        (e.g. ``crop_classification`` if it ever lands in this branch);
+      * **Pattern B without finalize()**: the adapter has no override;
         we just flip status to ``completed`` and leave the run() payload
         alone.
 
-    Idempotency:
-      * Already terminal (failed/cancelled) → bail.
-      * Already completed → bail (e.g. a previous sweep won the race).
-      * Already running → bail (a previous sweep started finalize and is
-        still waiting on the long GEE poll).
+    The finalize hook runs on its **own background thread**.  That matters
+    for two reasons:
 
-    Any exception inside the adapter's finalize() is caught here and
-    written as ``status='failed'`` with a traceback in the logs — the
-    caller never sees it.
+      * a finalize can take many minutes (a Guangxi-scale raster is ~5 G
+        pixels and is downloaded in ~300 aligned tiles) — running it inline
+        would block the HTTP request path (``GET /api/jobs/{id}``) and the
+        whole poller sweep, stalling every other GEE job in the process;
+      * a server restart then kills only the download, not the poller, and
+        the next sweep re-dispatches the finalize (the job is still
+        "running" in the DB but no longer in ``_FINALIZE_IN_FLIGHT``).
+
+    Idempotency:
+      * Already terminal (failed/cancelled/completed) → bail.
+      * A finalize is already in flight for this job → bail.
     """
     full = job_store.get_job(job_id)
     if full is None:
         return
     status_now = full.get("status")
-    if status_now in ("failed", "cancelled", "completed", "running"):
-        # Either already terminal, or another sweep is mid-finalize.
+    if status_now in ("failed", "cancelled", "completed"):
+        # Already terminal — nothing to finalize.
         return
     algorithm_id = full.get("algorithm")
     if not algorithm_id:
@@ -578,7 +758,19 @@ def _dispatch_finalize(job_id: str) -> None:
 
     job_dir = os.path.join(str(JOBS_DIR), job_id)
 
-    if finalize is None:
+    # Every adapter inherits ``AlgorithmAdapter.finalize``, so the mere
+    # presence of the attribute says nothing — check whether the adapter
+    # actually *overrode* it.  An adapter that did not is a "Pattern B
+    # without finalize": the GEE task is done and there is nothing to
+    # download, so the job simply flips to completed.
+    from app.algorithms.base import AlgorithmAdapter
+
+    has_finalize_hook = (
+        finalize is not None
+        and getattr(type(adapter), "finalize", None) is not AlgorithmAdapter.finalize
+    )
+
+    if not has_finalize_hook:
         # Pattern B without finalize: just flip to "completed". The result
         # payload from run() stays as-is.
         try:
@@ -593,20 +785,81 @@ def _dispatch_finalize(job_id: str) -> None:
             traceback.print_exc()
         return
 
+    # Claim the job before starting the thread so two sweeps (or a sweep and
+    # an HTTP request) can't both start a download of the same asset.
+    with _FINALIZE_IN_FLIGHT_LOCK:
+        if job_id in _FINALIZE_IN_FLIGHT:
+            return
+        _FINALIZE_IN_FLIGHT.add(job_id)
+
+    thread = threading.Thread(
+        target=_run_finalize,
+        args=(job_id, full, finalize, job_dir),
+        name=f"gee-finalize-{job_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _run_finalize(
+    job_id: str,
+    full: Dict[str, Any],
+    finalize,
+    job_dir: str,
+) -> None:
+    """Run the adapter's finalize hook and persist its result.
+
+    Runs on the finalize background thread.  Any exception is turned into a
+    ``status='failed'`` row; the caller never sees it.
+    """
     try:
-        # Mark "running" while finalize is in flight. The early-return
-        # guard at the top of _refresh_gee_status now matches "running",
-        # so a second sweep 10 s later will skip this job and not pile
-        # concurrent finalize() calls onto the same adapter.
+        # Mark "running" while finalize is in flight.  The polling guard in
+        # _refresh_gee_status skips jobs listed in _FINALIZE_IN_FLIGHT, so a
+        # second sweep won't pile a concurrent download onto the same asset.
         job_store.update_job(
             job_id,
             status="running",
             message="GEE 任务已完成，开始 finalize（下载结果文件）",
         )
-        new_result = finalize(full, job_dir)
+
+        def _on_progress(pct: int, message: str) -> None:
+            """Surface the download's progress on the job row.
+
+            A finalize can take many minutes (a province-scale raster is
+            ~5 G pixels, downloaded as ~300 aligned tiles).  Without this
+            the card would sit at "running / 10%" for the whole download
+            and look frozen.  Clamped to 99 because "completed" is the
+            job service's call to make.
+            """
+            try:
+                job_store.update_job(
+                    job_id,
+                    status="running",
+                    progress=max(1, min(99, int(pct))),
+                    message=message,
+                )
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+
+        # Same reasoning as _run_gee: finalize makes GEE calls while a
+        # concurrently-submitted run may be using EE.  The session keeps the
+        # binding pinned to this job's project for the whole download (the
+        # finalize hooks also call initialize_ee themselves — redundant, but
+        # cheap, and it keeps them correct if called directly).
+        finalize_project = project_for_job(full)
+        if finalize_project:
+            with gee_session(finalize_project):
+                new_result = finalize(full, job_dir, _on_progress)
+        else:
+            new_result = finalize(full, job_dir, _on_progress)
         if new_result is None:
-            # Adapter declined to finalize (e.g. missing asset_id). Leave
-            # the job in whatever state the adapter thinks is right.
+            # The adapter declined to finalize (e.g. the job row has no
+            # asset_id to download).  Leaving the job at "running" would
+            # strand it forever — mark it failed with an explanation.
+            _mark_finalize_failed(
+                job_id,
+                "finalize 未返回结果：任务缺少 GEE 资产信息，无法拉取结果。",
+            )
             return
         finished_at = _utc_now_iso()
         job_store.update_job(
@@ -617,16 +870,22 @@ def _dispatch_finalize(job_id: str) -> None:
             message=new_result.get("message", ""),
             finished_at=finished_at,
         )
+    except GeeAuthRequired as exc:
+        # Already a user-facing Chinese message from gee_auth. Show it
+        # verbatim — prefixing "finalize 失败:" would bury the actionable
+        # `earthengine authenticate --force` line that the front-end greps
+        # for when deciding to render the copy-command hint.
+        _mark_finalize_failed(job_id, str(exc))
+    except GeeNetworkError as exc:
+        # Same reasoning: the network message is already actionable
+        # ("check the proxy, then retry"), so don't bury it.
+        _mark_finalize_failed(job_id, str(exc))
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
-        try:
-            job_store.update_job(
-                job_id,
-                status="failed",
-                message=f"finalize 失败: {exc}",
-            )
-        except Exception:  # noqa: BLE001
-            traceback.print_exc()
+        _mark_finalize_failed(job_id, _finalize_error_message(exc, project_for_job(full)))
+    finally:
+        with _FINALIZE_IN_FLIGHT_LOCK:
+            _FINALIZE_IN_FLIGHT.discard(job_id)
 
 
 def _poll_one_gee_job(job: Dict[str, Any]) -> None:
@@ -741,41 +1000,43 @@ def _query_gee_status(
             import ee  # local import so non-GEE paths don't pay the cost
         except ImportError:
             return (None, None)
-        try:
+
+        # EE has one project binding per process. A run or a finalize may be
+        # using GEE right now under its own project; rebinding underneath it
+        # corrupts *its* requests — that is exactly how a run ends up failing
+        # with a permission error naming a project nobody selected. So a busy
+        # GEE means "skip this cycle", never "wait and steal".
+        from app.services.gee_auth import gee_probe_lock, initialize_ee
+
+        with gee_probe_lock(_GEE_PROBE_LOCK_TIMEOUT) as acquired:
+            if not acquired:
+                return (None, None)
             try:
-                # Initialize EE against the job's OWN project. Calling
-                # ``ee.Initialize()`` with no argument (which is what would
-                # happen if we relied solely on EE_PROJECT or omitted the
-                # arg here) silently rebinds to the OAuth quota_project
-                # and breaks subsequent getTaskStatus() calls — see the
-                # docstring above for the failure mode this guards against.
-                from app.services.gee_auth import initialize_ee
+                # Bind EE to the job's OWN project while we hold the lock.
+                # ``ee.Initialize()`` with no argument (what would happen if we
+                # relied solely on EE_PROJECT, or omitted the arg here) silently
+                # rebinds to the OAuth quota_project and breaks subsequent
+                # getTaskStatus() calls — see this function's docstring.
                 if project:
                     initialize_ee(project)
-                else:
-                    # No project available (e.g. a malformed DB row);
-                    # skip the re-init rather than risk wiping whatever
-                    # binding the previous run established.
-                    pass
+                # No project available (e.g. a malformed DB row): skip the
+                # re-init rather than disturb whatever binding is in place.
+                info = ee.data.getTaskStatus(task_id)
+                # earthengine-api returns a *list* of task descriptors (one per
+                # requested task id), not a single dict. Older docs and snippets
+                # treat it as a dict — that path raises AttributeError which is
+                # swallowed below and silently turns every probe into
+                # "(None, None)", so COMPLETED is never detected. Normalize to
+                # the descriptor dict before reading state/error_message.
+                if isinstance(info, list):
+                    info = info[0] if info else None
+                if not isinstance(info, dict):
+                    return (None, None)
+                state = info.get("state", "UNKNOWN")
+                err = info.get("error_message") or None
+                return (_GEE_STATE_MAP.get(state, "submitted"), err)
             except Exception:
-                # Already initialized in another thread, or auth missing — try anyway.
-                pass
-            info = ee.data.getTaskStatus(task_id)
-            # earthengine-api returns a *list* of task descriptors (one per
-            # requested task id), not a single dict. Older docs and snippets
-            # treat it as a dict — that path raises AttributeError which is
-            # swallowed below and silently turns every probe into
-            # "(None, None)", so COMPLETED is never detected. Normalize to
-            # the descriptor dict before reading state/error_message.
-            if isinstance(info, list):
-                info = info[0] if info else None
-            if not isinstance(info, dict):
                 return (None, None)
-            state = info.get("state", "UNKNOWN")
-            err = info.get("error_message") or None
-            return (_GEE_STATE_MAP.get(state, "submitted"), err)
-        except Exception:
-            return (None, None)
 
     try:
         future = _GEE_EXECUTOR.submit(_probe)

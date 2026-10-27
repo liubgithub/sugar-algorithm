@@ -6,7 +6,15 @@
   ],
   "mosaic": false,
   "mosaic_count": 1,
-  "schema_version": 4,
+  "schema_version": 8,
+  "source_signature": [
+    [
+      1789889661945881500,
+      49806282,
+      0,
+      0
+    ]
+  ],
   "type": "continuous",
   "width": 28240,
   "height": 20358,

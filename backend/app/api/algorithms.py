@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from app.schemas.algorithm import AlgorithmListResponse
 from app.services import algorithm_registry as registry_service
-from app.services.gee_auth import GeeAuthRequired, initialize_ee
+from app.services.gee_auth import GeeAuthRequired, initialize_ee, is_auth_mismatch_error
 from app.storage import job_store
 
 router = APIRouter(prefix="/api/algorithms", tags=["algorithms"])
@@ -158,16 +158,47 @@ def verify_gee_asset(algorithm_id: str, body: SavedGeeAssetVerify) -> dict:
             status_code=404, detail=f"algorithm '{algorithm_id}' not found"
         )
 
-    project = body.project or "sodium-ray-505904-i3"
+    project = (body.project or "").strip()
+    if not project:
+        # 不再兜底到某个历史项目：拿一个用户没选过的项目去校验 Asset，报错只会
+        # 更让人困惑（"no permission to use project <你没填过的项目>"）。
+        return {
+            "ok": False,
+            "code": "missing_project",
+            "asset_id": body.asset_id,
+            "error": (
+                "缺少 GEE 项目 ID，无法校验该 Asset 是否可达。"
+                "请先填写『GEE 项目 ID』再校验。"
+            ),
+        }
+
     try:
         initialize_ee(project)
     except GeeAuthRequired as exc:
-        return {"ok": False, "asset_id": body.asset_id, "error": str(exc)}
+        return {
+            "ok": False,
+            "code": "gee_auth_required",
+            "asset_id": body.asset_id,
+            "error": str(exc),
+        }
 
     try:
         ee.data.getAsset(body.asset_id)
         return {"ok": True, "asset_id": body.asset_id, "project": project}
     except Exception as exc:  # noqa: BLE001
+        # `ee.Initialize` does no round trip, so a project/credential
+        # mismatch only shows up here — the GEE backend rejects the call
+        # with "Caller does not have required permission to use project X".
+        # Reporting that as "Asset 不存在，请确认存在性" sends the user
+        # chasing a typo that isn't there; report the real cause instead
+        # so the front-end can offer the re-authenticate action.
+        if is_auth_mismatch_error(exc):
+            return {
+                "ok": False,
+                "code": "gee_auth_required",
+                "asset_id": body.asset_id,
+                "error": str(GeeAuthRequired(project)),
+            }
         return {
             "ok": False,
             "asset_id": body.asset_id,

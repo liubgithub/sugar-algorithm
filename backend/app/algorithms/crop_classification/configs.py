@@ -160,6 +160,19 @@ CLASS_COLORS: dict = {
 CLASS_METADATA_SUFFIX: str = ".metadata.json"
 
 
+# How many independent GeoTIFFs the classification result is cut into.
+#
+# The result of a large export only makes sense as a whole: the very same
+# algorithm, run locally, hands back two separate .tif files that have to be
+# stitched together before they show the complete map.  The platform keeps
+# that shape — the shards stay separate files (each one downloadable on its
+# own) and carry a shared ``group`` so the result page stitches them back
+# into one map for the preview.
+#
+# 1 disables the split and keeps the classic single-GeoTIFF output.
+DEFAULT_SHARD_COUNT: int = 2
+
+
 __all__ = [
     "BAND_NAMES",
     "MIN_VALUES",
@@ -183,4 +196,5 @@ __all__ = [
     "CLASS_LABELS",
     "CLASS_COLORS",
     "CLASS_METADATA_SUFFIX",
+    "DEFAULT_SHARD_COUNT",
 ]

@@ -40,10 +40,26 @@ Two paths are supported:
 
 Delivery
 ---------
-Submit `Export.image.toAsset` (not `toDrive`), wait for the asset to
-become queryable, then download it into the job's working directory
-via `geemap.ee_export_image`, so the platform's ResultRenderer can
-preview / download the produced GeoTIFF directly.
+Submit `Export.image.toAsset` (not `toDrive`) and return immediately.
+The GEE-side compute is then awaited by the platform's background GEE
+poller, which calls `finalize()` once the task reports COMPLETED.  The
+finalize hook waits for the asset to become queryable and downloads it
+into the job's working directory with a *tiled* downloader
+(`app.services.gee_raster`), so the platform's ResultRenderer can preview
+/ download the produced GeoTIFF directly.
+
+Why the split (submit / finalize)
+---------------------------------
+A Guangxi-scale harvest export takes many hours of GEE compute (the
+reference run took 17 h).  Waiting for it inside `run()` on a daemon
+worker thread meant that any server restart killed the waiter and the job
+sat at 92 % forever with an empty result column — the platform had no
+task id to poll, so it could never pick the job up again.
+
+With the split, `run()` persists the GEE task id immediately.  The poller
+then owns the wait: it survives server restarts, it has no timeout that
+could expire mid-compute, and the result is fetched whenever the task
+finally completes.
 
 The original Sentinel-1 logic — focal_median smoothing, linear-scale
 backscatter conversion, RVI / NDPI / VH-texture, base vs current
@@ -57,12 +73,15 @@ Python / GEE stack traces (per spec).
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import ee
 
 from app.algorithms.base import ProgressCallback, make_card, make_result
-from app.services.gee_auth import GeeAuthRequired, initialize_ee
+from app.services.gee_auth import (
+    GeeAuthRequired,
+    initialize_ee,
+)
 
 
 # 固定算法参数（用户不动时行为与原硬编码完全一致）。
@@ -90,6 +109,18 @@ _LOCAL_MASK_MAX_TILES = 5000
 # 的检测结果零影响；同时相比「整个掩膜 bbox」ROI 可大幅缩小 SAR
 # 分析区域和导出体积。
 _ROI_BUFFER_M = 2000
+
+# 下载 Asset 时的分块参数（见 app.services.gee_raster）。
+# 4096x4096 的 INT 图块约 33 MB，落在 GEE 单次请求 48 MiB 的安全区内；
+# 并发数保持得较低，避免触发 GEE 的 429 限流。
+_DOWNLOAD_TILE_PIXELS = 4096
+_DOWNLOAD_MAX_WORKERS = 4
+
+# finalize 阶段等待 GEE 资产可查询的上限（秒）。
+# 任务 COMPLETED 之后资产通常几秒内就可读，30 分钟足够覆盖 GEE 端
+# 落盘 Cloud Storage 的延迟；超时只针对"资产始终不出现"，不会因为
+# GEE 端计算太久而误判（计算时长由平台轮询负责，不在这里计时）。
+_FINALIZE_ASSET_TIMEOUT = 1800.0
 
 
 def _initialize_ee(project: Optional[str]) -> None:
@@ -119,87 +150,37 @@ def _calculate_sar_metrics(image: ee.Image) -> ee.Image:
     return ee.Image.cat([rvi, ndpi, vh_texture]).copyProperties(image, ["system:time_start"])
 
 
-def _wait_for_task(
-    task,
-    *,
-    timeout: float = 7200.0,
-    poll: float = 10.0,
-    progress_callback=None,
-) -> None:
-    """Poll `task.status()` until the export task is COMPLETED.
-
-    Replaces the old `_wait_for_asset` (which polled `ee.data.getAsset`
-    and returned the instant the asset placeholder existed — even when
-    the underlying export was still RUNNING, which caused premature
-    timeouts for large-area SAR exports such as a 850 km × 560 km ROI
-    at 10 m resolution).
-
-    Args:
-        task: an `ee.batch.Task` returned by `task.start()`.
-        timeout: max seconds to wait before raising TimeoutError.
-        poll: seconds between status polls.
-        progress_callback: optional callable(percent, message) for live
-            progress updates while waiting.
-
-    Raises:
-        RuntimeError: on FAILED / CANCELLED states.
-        TimeoutError: when state is still not COMPLETED after `timeout`.
-    """
-    import time
-
-    deadline = time.monotonic() + timeout
-    last_status: Optional[Dict[str, Any]] = None
-    start = time.monotonic()
-    while time.monotonic() < deadline:
-        status = task.status()
-        last_status = status
-        state = status.get("state", "UNKNOWN")
-        if state == "COMPLETED":
-            return
-        if state in ("FAILED", "CANCELLED"):
-            raise RuntimeError(
-                f"GEE 任务失败：state={state}, "
-                f"id={status.get('id')}, info={status}"
-            )
-        if progress_callback:
-            elapsed = int(time.monotonic() - start)
-            progress_callback(
-                92,
-                f"正在等待 GEE 任务完成（state={state}，已运行 {elapsed}s）",
-            )
-        time.sleep(poll)
-    last_id = (last_status or {}).get("id")
-    last_state = (last_status or {}).get("state", "UNKNOWN")
-    raise TimeoutError(
-        f"GEE 任务超时（>{int(timeout)}s），"
-        f"id={last_id}, last state={last_state}"
-    )
-
-
 def _download_asset_to_local(
     asset_id: str,
     *,
     local_path: str,
-    scale: int,
-    region: ee.Geometry,
-) -> None:
-    """Stream a GEE Asset Image to a local GeoTIFF.
+    progress_callback: Optional[ProgressCallback] = None,
+    tile_pixels: int = _DOWNLOAD_TILE_PIXELS,
+    max_workers: int = _DOWNLOAD_MAX_WORKERS,
+) -> Dict[str, Any]:
+    """Stream a GEE Asset Image to a local GeoTIFF, tile by tile.
 
-    Uses `geemap.ee_export_image`, which transparently handles both the
-    `getDownloadURL` path (small images) and the chunked tiling path
-    (large images). The destination directory is created if missing.
+    `geemap.ee_export_image` (the previous implementation) issues a
+    *single* `getDownloadURL` request, and GEE caps one request at
+    32768 px per side / 48 MiB.  A Guangxi-scale harvest mask is
+    84 720 x 59 251 = 5.02 G pixels, so that single request always
+    failed with
+
+        Pixel grid dimensions (84722x59287) must be less than or equal
+        to 32768
+
+    `app.services.gee_raster` downloads the asset in aligned tiles
+    instead and stitches them into one GeoTIFF on the asset's own pixel
+    grid.  Returns the download statistics.
     """
-    import geemap  # type: ignore
+    from app.services.gee_raster import download_asset_to_geotiff
 
-    out_dir = os.path.dirname(os.path.abspath(local_path))
-    os.makedirs(out_dir, exist_ok=True)
-
-    geemap.ee_export_image(
-        ee_object=ee.Image(asset_id),
-        filename=local_path,
-        scale=scale,
-        region=region,
-        file_per_band=False,
+    return download_asset_to_geotiff(
+        asset_id,
+        local_path,
+        tile_pixels=tile_pixels,
+        max_workers=max_workers,
+        progress_callback=progress_callback,
     )
 
 
@@ -454,8 +435,18 @@ def run(
         params.get("gee_project_id")
         or params.get("gee_project")
         or os.environ.get("EE_PROJECT")
-        or "sodium-ray-505904-i3"
     )
+    if not project:
+        # 不再兜底到某个历史项目。静默用一个用户没选过的项目发起 GEE 请求，
+        # 正是「报错里出现一个我没填过的项目名」这类问题的来源；宁可明确失败。
+        return make_result(
+            status="failed",
+            result_type="json",
+            message=(
+                "缺少 GEE 项目 ID：请在『GEE 项目 ID』字段填写，"
+                "或设置环境变量 EE_PROJECT。"
+            ),
+        )
 
     try:
         _initialize_ee(project)
@@ -611,97 +602,40 @@ def run(
     task_id = getattr(task, "id", None) or task.status().get("id")
     asset_id = f"projects/{project}/assets/{description}"
 
-    # ---------- 5. 等待 GEE 任务完成 ----------
+    # ---------- 5. 返回「已提交」，后续交给平台后台轮询 ----------
+    # 这里**不再**等待 GEE 任务完成。广西尺度的收割监测导出在 GEE 端要跑
+    # 十几个小时（实测 17 h），在 run() 里同步等待会带来两个硬伤：
+    #   * 服务器一旦重启（uvicorn --reload 就会），等待线程被杀掉，任务
+    #     永远停在 92%，而且 result 列是空的 —— 平台拿不到 task_id，
+    #     再也接不上这个任务；
+    #   * 就算不重启，2 小时的等待上限也会把一个仍在正常计算的任务误判
+    #     成失败。
+    # 现在 run() 只负责提交并立刻把 task_id / asset_id 落库，之后的等待、
+    # 状态跟踪、结果拉取全部交给平台后台轮询 → finalize()。
     if progress_callback:
-        progress_callback(92, "正在等待 GEE 任务完成（state=STARTING）")
-
-    try:
-        _wait_for_task(
-            task,
-            timeout=7200.0,
-            poll=10.0,
-            progress_callback=progress_callback,
-        )
-    except RuntimeError as exc:
-        return make_result(
-            status="failed",
-            result_type="json",
-            message=f"GEE 任务失败（task_id={task_id}）：{exc}",
-        )
-    except TimeoutError as exc:
-        return make_result(
-            status="failed",
-            result_type="json",
-            message=(
-                f"GEE 任务超时（task_id={task_id}，已等待 >2h）。"
-                f"请去 GEE Code Editor → Tasks 标签查看该任务当前进度；"
-                f"若已 COMPLETED，可直接去 Assets 手动下载 {asset_id}。"
-                f"详情：{exc}"
-            ),
-        )
-
-    if progress_callback:
-        progress_callback(95, "正在下载结果到本地")
-
-    local_tif_path = os.path.abspath(os.path.join(job_dir, f"{description}.tif"))
-    try:
-        _download_asset_to_local(
-            asset_id,
-            local_path=local_tif_path,
-            scale=scale,
-            region=roi,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return make_result(
-            status="failed",
-            result_type="json",
-            message=(
-                f"下载 GEE 资产到本地失败（task_id={task_id}, asset={asset_id}）："
-                f"{exc}。可在 GEE Code Editor 的 Assets 标签页手动下载 {asset_id}。"
-            ),
-        )
-
-    if not os.path.isfile(local_tif_path):
-        return make_result(
-            status="failed",
-            result_type="json",
-            message=(
-                f"GEE 资产下载完成但未找到本地文件：{local_tif_path}。"
-                f"请检查 geemap.ee_export_image 输出目录配置（task_id={task_id}）。"
-            ),
-        )
-
-    size_bytes = os.path.getsize(local_tif_path)
-
-    # ---------- 6. 返回结果 ----------
-    if progress_callback:
-        progress_callback(100, "完成")
+        progress_callback(90, "GEE 导出任务已提交，等待云端计算完成")
 
     return make_result(
-        status="completed",
-        result_type="raster",
-        files=[
-            {
-                "name": f"{description}.tif",
-                "label": "harvest_mask",
-                "path": local_tif_path,
-                "size_bytes": size_bytes,
-            }
-        ],
+        status="submitted",
+        result_type="gee_task",
+        gee_task_id=task_id,
+        progress=10,
         metrics={
             "year": year,
             "base_window": f"{base_start} → {base_end}",
             "current_window": f"{current_start} → {current_end}",
             "gee_task_id": task_id,
             "asset_id": asset_id,
+            "description": description,
             "mask_source": mask_source,
             "mask_source_label": mask_source_label,
             "rvi_absolute_low": rvi_absolute_low,
             "rvi_drop_min": rvi_drop_min,
             "scale": scale,
             "crs": crs,
+            "max_pixels": max_pixels,
             "cards": [
-                make_card("task_status", "任务状态", "完成", ""),
+                make_card("task_status", "任务状态", "已提交，等待 GEE 计算", ""),
                 make_card("year", "目标年份", year, "年"),
                 make_card(
                     "base_window", "基期窗口", f"{base_start} → {base_end}", ""
@@ -716,21 +650,152 @@ def run(
                 make_card("rvi_drop", "RVI 下降阈值", rvi_drop_min, ""),
                 make_card("scale", "导出分辨率", scale, "m"),
                 make_card("mask_source", "掩膜来源", mask_source, ""),
-                make_card("gee_task_id", "GEE 任务 ID", task_id, ""),
-                make_card("asset_id", "GEE 资产", asset_id, ""),
+            ],
+        },
+        message=(
+            f"GEE 收割监测任务已提交（task_id={task_id}，asset={asset_id}，"
+            f"年份={year}）。云端计算完成后会自动拉取结果。"
+        ),
+    )
+
+
+def finalize(
+    job: Dict[str, Any],
+    job_dir: str,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Optional[Dict[str, Any]]:
+    """拉取已完成的 GEE 收割监测结果，产出本地 GeoTIFF。
+
+    由平台后台 GEE 轮询在任务 COMPLETED 之后调用。流程：
+
+      1. 从任务结果里取出 ``asset_id`` / ``description``；
+      2. 绑定该任务自己的 GEE 项目（进程内的 EE 绑定是全局的）；
+      3. 等资产可查询（任务 COMPLETED 与资产可读之间通常只差几秒）；
+      4. 分块下载到 ``job_dir`` 下的 ``<description>.tif``；
+      5. 返回 completed 结果，平台据此渲染栅格卡片 / 预览图 / 下载链接。
+
+    没有等待上限：GEE 端算多久就等多久，任务不会因为等待超时被误判为
+    失败 —— 这正是原来「17 h 的任务卡在 92 %」要解决的问题。
+    """
+    from app.services.gee_auth import project_for_job
+    from app.services.gee_raster import wait_for_asset
+
+    result = (job or {}).get("result") or {}
+    metrics = result.get("metrics") or {}
+
+    asset_id = str(metrics.get("asset_id") or "").strip()
+    description = str(metrics.get("description") or "").strip()
+    if not asset_id or not description:
+        raise RuntimeError(
+            "任务结果里缺少 GEE 资产信息（asset_id / description），无法拉取结果。"
+        )
+
+    project = project_for_job(job)
+    if not project:
+        raise RuntimeError(
+            "无法从任务参数或结果中解析出该任务的 GEE 项目 ID，"
+            "请检查任务的『GEE 项目 ID』参数。"
+        )
+    initialize_ee(project)
+
+    if progress_callback:
+        progress_callback(50, "等待 GEE 资产就绪")
+
+    wait_for_asset(
+        asset_id,
+        timeout=_FINALIZE_ASSET_TIMEOUT,
+        poll=5.0,
+        progress_callback=progress_callback,
+    )
+
+    if progress_callback:
+        progress_callback(55, "正在分块下载 GEE 结果到本地")
+
+    # 下载器自己报 0→100；这里映射到 55→95 的区间，避免进度条往回跳。
+    def _download_progress(pct: int, message: str) -> None:
+        if progress_callback:
+            progress_callback(55 + int(40 * max(0, min(100, pct)) / 100), message)
+
+    local_tif_path = os.path.abspath(os.path.join(job_dir, f"{description}.tif"))
+    stats = _download_asset_to_local(
+        asset_id,
+        local_path=local_tif_path,
+        progress_callback=_download_progress,
+    )
+
+    if not os.path.isfile(local_tif_path):
+        raise RuntimeError(f"GEE 资产下载完成但未找到本地文件：{local_tif_path}")
+
+    size_bytes = os.path.getsize(local_tif_path)
+
+    if progress_callback:
+        progress_callback(100, "完成")
+
+    year = metrics.get("year")
+    task_id = metrics.get("gee_task_id") or result.get("gee_task_id")
+    width = stats.get("width")
+    height = stats.get("height")
+
+    return make_result(
+        status="completed",
+        result_type="raster",
+        files=[
+            {
+                "name": f"{description}.tif",
+                "label": "harvest_mask",
+                "path": local_tif_path,
+                "size_bytes": size_bytes,
+            }
+        ],
+        metrics={
+            **metrics,
+            "description": description,
+            "gee_task_id": task_id,
+            "asset_id": asset_id,
+            "raster_width": width,
+            "raster_height": height,
+            "raster_crs": stats.get("crs"),
+            "tile_count": stats.get("tile_count"),
+            "cards": [
+                make_card("task_status", "任务状态", "完成", ""),
+                make_card("year", "目标年份", year, "年"),
                 make_card(
-                    "output_tif",
-                    "输出文件",
-                    f"{description}.tif",
+                    "base_window", "基期窗口", str(metrics.get("base_window", "")), ""
+                ),
+                make_card(
+                    "current_window",
+                    "监测期窗口",
+                    str(metrics.get("current_window", "")),
                     "",
+                ),
+                make_card(
+                    "rvi_low", "RVI 绝对下限", metrics.get("rvi_absolute_low"), ""
+                ),
+                make_card(
+                    "rvi_drop", "RVI 下降阈值", metrics.get("rvi_drop_min"), ""
+                ),
+                make_card("scale", "导出分辨率", metrics.get("scale"), "m"),
+                make_card("mask_source", "掩膜来源", metrics.get("mask_source"), ""),
+                make_card(
+                    "raster_size",
+                    "栅格尺寸",
+                    f"{width} × {height}",
+                    "px",
+                ),
+                make_card(
+                    "file_size",
+                    "文件大小",
+                    f"{size_bytes / (1024 * 1024):.1f}",
+                    "MB",
                 ),
             ],
         },
         message=(
             f"GEE 收割监测完成（task_id={task_id}，asset={asset_id}，"
-            f"年份={year}，输出 {description}.tif {size_bytes} B）"
+            f"年份={year}，输出 {description}.tif "
+            f"{width}×{height}，{size_bytes / (1024 * 1024):.1f} MB）"
         ),
     )
 
 
-__all__ = ["run"]
+__all__ = ["finalize", "run"]

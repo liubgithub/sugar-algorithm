@@ -207,6 +207,15 @@
     <button type="button" class="button button--add" @click="addBlock">
       + 添加展示块
     </button>
+
+    <p class="onlyshow__storage">
+      本地存储占用 {{ fmtUsage() }}
+      <span v-if="storageUsage >= STORAGE_QUOTA_BYTES * STORAGE_HIGH_RATIO" class="onlyshow__storage--high">
+        （接近上限，建议删掉一些展示块）
+      </span>
+    </p>
+
+    <p v-if="storageWarn" class="onlyshow__storage-warn">{{ storageWarn }}</p>
   </div>
 </template>
 
@@ -214,6 +223,12 @@
 import { onMounted, reactive, ref } from 'vue'
 
 const STORAGE_KEY = 'onlyshow-blocks-v1'
+// 降级副本：完整版（含 base64 图）写不进 localStorage 时，只把「标题 / 说明 / 图例
+// 配置」写到这个独立 key。**绝不覆盖 STORAGE_KEY** —— 早前版本在写满时会把 STORAGE_KEY
+// 改写成一份每张图都是空 slot 的元数据，等于一次 QuotaExceeded 就把所有已存的图擦光。
+const META_KEY = 'onlyshow-meta-v1'
+// Chrome / Edge 的 localStorage 上限约 5MB，用来算占用率提示用户。
+const STORAGE_QUOTA_BYTES = 5 * 1024 * 1024
 
 // 缓存最近上传的原始 File 对象，按 (blockId, slotIndex) 索引。File 不能 JSON
 // 序列化、不进 localStorage，所以放在外面。刷新页面后丢失，再次切换 mode /
@@ -522,6 +537,18 @@ const HEADER_DESCRIPTION = '展示已有数据。每块独立编辑标题与上�
 
 const blocks = reactive([])
 
+// 存储告警文案。saveBlocks 写不进完整版时置位（图片可能没存上），写成功后清空。
+const storageWarn = ref('')
+// 完整版存档的字符数（Chrome 按 UTF-16 code unit 计入 5MB 配额），用于占用提示。
+const storageUsage = ref(0)
+const STORAGE_HIGH_RATIO = 0.8
+
+function fmtUsage() {
+  const mb = storageUsage.value / 1024 / 1024
+  const total = STORAGE_QUOTA_BYTES / 1024 / 1024
+  return `${mb < 0.05 ? '<0.05' : mb.toFixed(2)} / ${total} MB`
+}
+
 function makeId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
 }
@@ -552,54 +579,73 @@ function makeBlock(isHeader = false) {
   }
 }
 
-async function loadBlocks() {
+// 读一份存档。结构是 { savedAt, blocks }；早前版本直接存的是裸数组（没有
+// savedAt），按 savedAt = 0 处理，这样后面两份存档比较新旧时不会偏向任何一边。
+function readArchive(key) {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        for (const b of parsed) {
-          // 兼容旧版缓存：缺字段时补默认；uploading 永远重置成 false。
-          // 旧版用 imageDataUrl/lastFileName/stats/type/classes/classMetadata
-          // 这些顶层字段；新版统一搬到 files[0]，新增 slot 1 占位。
-          const files = []
-          if (b.imageDataUrl || b.lastFileName || b.stats || b.type || b.classes || b.classMetadata) {
-            files.push({
-              imageDataUrl: b.imageDataUrl || '',
-              lastFileName: b.lastFileName || '',
-              stats: b.stats || null,
-              type: b.type || '',
-              classes: b.classes || null,
-              classMetadata: b.classMetadata || null,
-            })
-          }
-          if (Array.isArray(b.files) && b.files.length > 0) {
-            for (const f of b.files) files.push({ ...emptySlot(), ...f })
-          }
-          if (files.length === 0) files.push(emptySlot())
-          blocks.push({
-            uploading: false,
-            mode: 'continuous',
-            customColors: {},
-            uniqueValues: [],
-            classNotes: {},
-            ...b,
-            files,
-          })
-        }
-        return
-      }
+    const raw = localStorage.getItem(key)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    const size = raw.length
+    if (Array.isArray(parsed)) return { savedAt: 0, size, blocks: parsed }
+    if (parsed && Array.isArray(parsed.blocks) && parsed.blocks.length > 0) {
+      return { savedAt: Number(parsed.savedAt) || 0, size, blocks: parsed.blocks }
     }
   } catch (err) {
-    console.warn('Onlyshow: 读取本地缓存失败', err)
+    console.warn(`Onlyshow: 读取本地缓存 ${key} 失败`, err)
+  }
+  return null
+}
+
+async function loadBlocks() {
+  // 两份存档里取更新的那份。平时只有完整版；写满降级后元数据版才是最新的
+  // （此时完整版里还留着旧图，直接用完整版会把用户刚删掉的块复活回来）。
+  const full = readArchive(STORAGE_KEY)
+  const meta = readArchive(META_KEY)
+  const src = !full ? meta : !meta ? full : (meta.savedAt > full.savedAt ? meta : full)
+  // 打开页面就显示当前占用（而不是等到第一次 saveBlocks 之后）。
+  storageUsage.value = full ? full.size : 0
+
+  if (src) {
+    for (const b of src.blocks) {
+      // 兼容旧版缓存：缺字段时补默认；uploading 永远重置成 false。
+      // 旧版用 imageDataUrl/lastFileName/stats/type/classes/classMetadata
+      // 这些顶层字段；新版统一搬到 files[0]，新增 slot 1 占位。
+      const files = []
+      if (b.imageDataUrl || b.lastFileName || b.stats || b.type || b.classes || b.classMetadata) {
+        files.push({
+          imageDataUrl: b.imageDataUrl || '',
+          lastFileName: b.lastFileName || '',
+          stats: b.stats || null,
+          type: b.type || '',
+          classes: b.classes || null,
+          classMetadata: b.classMetadata || null,
+        })
+      }
+      if (Array.isArray(b.files) && b.files.length > 0) {
+        for (const f of b.files) files.push({ ...emptySlot(), ...f })
+      }
+      if (files.length === 0) files.push(emptySlot())
+      blocks.push({
+        uploading: false,
+        mode: 'continuous',
+        customColors: {},
+        uniqueValues: [],
+        classNotes: {},
+        ...b,
+        files,
+      })
+    }
   }
   // 缓存不存在或解析失败：保证页面不空，给一个默认的「标题块」。
   if (blocks.length === 0) blocks.push(makeBlock(true))
 
   // 从 IndexedDB 恢复原始 file blob（fileCache 在刷新后是空的，
   // 没有这一步的话用户改色 / 切 mode 都无法 triggerRender）。
-  // 每个 block 最多 2 个 slot，并行拉；恢复后如发现 customColors 与图上
-  // 实际颜色不一致，自动重渲一次，让图追上用户最后一次选的颜色。
+  // 注意：这一步**不能**因为 localStorage 里有数据就跳过 —— 早前版本在这里提前
+  // return 了，导致刷新后 fileCache 永远是空的。
+  // 每个 block 最多 2 个 slot，并行拉；恢复后如发现图丢了 / customColors 与图上
+  // 实际颜色不一致，自动重渲一次，让图补回来并追上用户最后一次选的颜色。
   const fetchJobs = []
   for (const b of blocks) {
     fetchJobs.push((async () => {
@@ -608,15 +654,17 @@ async function loadBlocks() {
       const [f0, f1] = await Promise.all([dbGet(k0), dbGet(k1)])
       if (f0 && !fileCache.has(k0)) fileCache.set(k0, f0)
       if (f1 && !fileCache.has(k1)) fileCache.set(k1, f1)
-      // 文件恢复成功 + 用户之前存了 customColors + 但图还没追上 → 重渲。
-      // 这样刷新后改色块 / 切 mode 都能立即更新图，不需要重新上传图。
+      // 文件恢复成功 + (图丢了 / 图还没追上用户最后的选色) → 重渲。
+      // 这样刷新后改色块 / 切 mode 都能立即更新图，不需要重新上传图；
+      // 而 localStorage 写满降级导致图被清掉时，也能靠 IndexedDB 里的原图自愈。
       const hasFile = fileCache.has(k0) || fileCache.has(k1)
       const hasCustom = b.customColors && Object.keys(b.customColors).length > 0
       const hasUV = Array.isArray(b.uniqueValues) && b.uniqueValues.length > 0
       const slot = (b.files || [])[0]
+      const missingImage = !(slot && slot.imageDataUrl)
       const cm = (slot && slot.classMetadata) || {}
-      let inSync = !hasCustom && !hasUV
-      if (!inSync) {
+      let inSync = true
+      if (hasCustom) {
         // 检查每个用户改过的 value，classMetadata 里对应 idx 的 color 是否一致。
         for (const [vk, wantColor] of Object.entries(b.customColors || {})) {
           let matched = false
@@ -628,10 +676,22 @@ async function loadBlocks() {
             }
           }
           if (!matched) { inSync = false; break }
-          inSync = true
         }
       }
-      if (hasFile && !inSync) {
+      if (inSync && hasUV) {
+        // 手动指定的唯一值都出现在 classMetadata 里 → 图确实是按这批值渲的，
+        // 不必重渲。（原来这里一律判为不同步，配合上面的 IDB 恢复会变成每次
+        // 打开页面都对每个用手动唯一值的块重渲一次。）
+        const present = new Set()
+        for (const k of Object.keys(cm)) {
+          const v = (cm[k] || {}).value
+          if (v !== undefined && v !== null) present.add(String(parseInt(v, 10)))
+        }
+        for (const uv of b.uniqueValues) {
+          if (!present.has(String(parseInt(uv, 10)))) { inSync = false; break }
+        }
+      }
+      if (hasFile && (missingImage || !inSync)) {
         // 用最新 customColors 触发重渲，abort 上一次；后端响应回来后图追上。
         triggerRender(b)
       }
@@ -640,46 +700,52 @@ async function loadBlocks() {
   await Promise.all(fetchJobs)
 }
 
-function saveBlocks() {
-  // 持久化前清掉 uploading 状态，避免页面刷新后还显示"处理中"
-  const lite = blocks.map((b) => ({
-    id: b.id,
-    title: b.title,
-    description: b.description,
-    files: (b.files || []).map((f) => ({
-      imageDataUrl: f.imageDataUrl || '',
-      lastFileName: f.lastFileName || '',
-      stats: f.stats || null,
-      type: f.type || '',
-      classes: f.classes || null,
-      classMetadata: f.classMetadata || null,
-    })),
-    mode: b.mode || 'continuous',
-    customColors: b.customColors || {},
-    uniqueValues: Array.isArray(b.uniqueValues) ? b.uniqueValues : [],
-    classNotes: b.classNotes || {},
-  }))
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(lite))
-  } catch (err) {
-    // localStorage 写满时降级：只持久化元数据，去掉 imageDataUrl（base64 PNG 可能 200KB+）。
-    // 用户下次打开仍能看到标题与说明，但需要重新上传。
-    console.warn('Onlyshow: 本地缓存写入失败', err)
-    const meta = lite.map((b) => ({
+// 序列化当前 blocks。includeImages=false 时剥掉 base64 PNG（写不下时的降级副本）。
+function serializeBlocks(includeImages) {
+  return JSON.stringify({
+    savedAt: Date.now(),
+    blocks: blocks.map((b) => ({
       id: b.id,
       title: b.title,
       description: b.description,
-      files: b.files.map(() => emptySlot()),
+      files: (b.files || []).map((f) => ({
+        imageDataUrl: includeImages ? (f.imageDataUrl || '') : '',
+        lastFileName: f.lastFileName || '',
+        stats: f.stats || null,
+        type: f.type || '',
+        classes: f.classes || null,
+        classMetadata: f.classMetadata || null,
+      })),
       mode: b.mode || 'continuous',
       customColors: b.customColors || {},
       uniqueValues: Array.isArray(b.uniqueValues) ? b.uniqueValues : [],
       classNotes: b.classNotes || {},
-    }))
+    })),
+  })
+}
+
+// 返回 true = 完整版（含图）已落盘；false = 只落了降级元数据。
+function saveBlocks() {
+  const full = serializeBlocks(true)
+  try {
+    localStorage.setItem(STORAGE_KEY, full)
+    // 完整版写成功 → 降级副本已过期，删掉，免得下次 load 拿到旧的元数据。
+    try { localStorage.removeItem(META_KEY) } catch { /* 忽略 */ }
+    storageUsage.value = full.length
+    storageWarn.value = ''
+    return true
+  } catch (err) {
+    // localStorage 写满（QuotaExceededError）。**关键：不动 STORAGE_KEY** —— 原来
+    // 那份带图的存档仍然完好，只是这次的新图没存上。降级元数据写到独立 key，
+    // 用户删掉一些块腾出空间后，下一次 saveBlocks 会自动把完整版补写回去。
+    console.warn('Onlyshow: 本地缓存写入失败（存储已满，本次改动可能未保存）', err)
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(meta))
+      localStorage.setItem(META_KEY, serializeBlocks(false))
     } catch (err2) {
       console.warn('Onlyshow: 降级持久化也失败', err2)
     }
+    storageWarn.value = `浏览器本地存储已满（约 ${Math.round(STORAGE_QUOTA_BYTES / 1024 / 1024)}MB）：标题和图例已保存，但新上传的图可能没存上，刷新后需要重新上传。删掉一些展示块可腾出空间。`
+    return false
   }
 }
 
@@ -1267,6 +1333,27 @@ onMounted(() => { loadBlocks() })
   font-weight: 500;
   padding-right: 12px;
   width: 60px;
+}
+
+/* 存储占用提示 + 写满告警 */
+.onlyshow__storage {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--color-muted);
+  text-align: center;
+}
+.onlyshow__storage--high {
+  color: #b45309;
+}
+.onlyshow__storage-warn {
+  margin: 6px 0 0;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #92400e;
+  background: #fffbeb;
+  border: 1px solid #fcd34d;
+  border-radius: 6px;
 }
 
 .button--add {

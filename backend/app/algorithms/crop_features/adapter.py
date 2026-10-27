@@ -39,10 +39,15 @@ class CropFeaturesAdapter(AlgorithmAdapter):
             "label": "GEE 项目 ID",
             "type": "text",
             "required": True,
-            "default": "sodium-ray-505904-i3",
+            # 刻意留空，不要预填任何具体项目。ee 的项目绑定是进程全局的，
+            # 预填值会在表单一加载、用户还没点运行时就把整个后端的 EE 切走，
+            # 污染同一进程里其它算法 / 其它任务的请求。
+            "default": "",
+            "placeholder": "例如：my-gee-project-123456",
             "hint": (
-                "用于 ee.Initialize(project=...)。"
-                "如需切换项目，请同时在本机执行 earthengine authenticate --force。"
+                "用于 ee.Initialize(project=...)，当前 GEE 账号必须对该项目有访问权限。"
+                "如需切换项目，请先在本机执行 earthengine authenticate --force，"
+                "再回来填这里的新项目 ID。"
             ),
         },
         {
@@ -62,16 +67,6 @@ class CropFeaturesAdapter(AlgorithmAdapter):
             "kind": "file",
             "slot": "samples",
             "required": False,
-            "hint": (
-                "上传本地 CSV 文件，UTF-8 编码，"
-                "首行为英文表头，必须包含 longitude 与 latitude 两列"
-                "（大小写不限，例如 longitude / Longitude / LONGITUDE 与 "
-                "latitude / Latitude / LATITUDE），"
-                "其它列会作为样本点的属性一并上传到 GEE。"
-                "研究区范围 = 样本点几何范围，无需单独上传。"
-                "留空则使用下方『已上传历史文件』中选一个，或在"
-                "「GEE 样本点 Asset ID」文本框直接粘贴 Asset ID。"
-            ),
             # 与 samples_asset_id 互斥：选择其一后，前端会自动清空另一个。
             "xors_with": ["samples_asset_id"],
         },
@@ -92,9 +87,8 @@ class CropFeaturesAdapter(AlgorithmAdapter):
             "default": "",
             "hint": (
                 "格式：projects/<project>/assets/<name>。"
-                "填写后将跳过本地 CSV 上传，直接复用此 Asset；"
-                "留空则使用上方的 CSV 上传或已上传历史文件。"
-                "提交后会做一次存在/可访问性校验。"
+                "填写后将跳过本地 CSV 上传"
+              
             ),
             "xors_with": ["samples_local_path"],
             "saved_picker": {
@@ -106,23 +100,23 @@ class CropFeaturesAdapter(AlgorithmAdapter):
             },
         },
         # ===== 三、固定参数（仅展示，不可修改）=====
-        {
-            "key": "__fixed_params_notice__",
-            "type": "notice",
-            "notice_type": "info",
-            "notice_icon": "ℹ️",
-            "label": "固定参数（仅展示，不可修改）",
-            "hint": (
-                f"本算法共输出 {cfg.TOTAL_FEATURE_COUNT} 个特征"
-                f"（{cfg.FEATURE_BAND_COUNT} 个波段 × {cfg.TIME_SERIES_MONTHS} 个月 "
-                f"+ 1 个 DEM 高程）。\n"
-                f"min_values 长度 = {len(cfg.MIN_VALUES)}；"
-                f"max_values 长度 = {len(cfg.MAX_VALUES)}；"
-                f"DEM 归一化区间 [{cfg.DEM_MIN}, {cfg.DEM_MAX}]；"
-                f"Sentinel-2 最大云量 ≤ {cfg.CLOUD_PCT_MAX}%。\n"
-                "以上参数由算法内置，禁止用户修改。"
-            ),
-        },
+        # {
+        #     "key": "__fixed_params_notice__",
+        #     "type": "notice",
+        #     "notice_type": "info",
+        #     "notice_icon": "ℹ️",
+        #     "label": "固定参数（仅展示，不可修改）",
+        #     "hint": (
+        #         f"本算法共输出 {cfg.TOTAL_FEATURE_COUNT} 个特征"
+        #         f"（{cfg.FEATURE_BAND_COUNT} 个波段 × {cfg.TIME_SERIES_MONTHS} 个月 "
+        #         f"+ 1 个 DEM 高程）。\n"
+        #         f"min_values 长度 = {len(cfg.MIN_VALUES)}；"
+        #         f"max_values 长度 = {len(cfg.MAX_VALUES)}；"
+        #         f"DEM 归一化区间 [{cfg.DEM_MIN}, {cfg.DEM_MAX}]；"
+        #         f"Sentinel-2 最大云量 ≤ {cfg.CLOUD_PCT_MAX}%。\n"
+        #         "以上参数由算法内置，禁止用户修改。"
+        #     ),
+        # },
         # ===== 四、高级（默认折叠）=====
         {
             "key": "cloud_pct_max",

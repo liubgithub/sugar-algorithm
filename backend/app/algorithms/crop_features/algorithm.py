@@ -39,7 +39,13 @@ import ee
 from app.algorithms.base import ProgressCallback, make_card, make_result
 from app.algorithms.configs import time_series_config as cfg
 from app.services import ingest_service
-from app.services.gee_auth import GeeAuthRequired, initialize_ee
+from app.services.gee_auth import (
+    GeeAuthRequired,
+    gee_idle,
+    initialize_ee,
+    is_auth_mismatch_error,
+    project_for_job,
+)
 from app.storage import job_store
 
 
@@ -264,8 +270,10 @@ def _ingest_samples(
 
     返回值是列表——单个 CSV 一般是 ``[asset_id]``；超过 GEE 的 10 MB
     ``Export.table.toAsset`` 上限（典型如 30+ MB 样本特征 CSV）会被切分为
-    多个 chunk asset，调用方需要 ``ee.FeatureCollection(asset_ids).flatten()``
-    服务端合并后使用。
+    多个 chunk asset，调用方需要
+    ``ingest_service.fc_from_asset_ids(asset_ids)`` 服务端合并后使用
+    （不能直接 ``ee.FeatureCollection(asset_ids)``，那是 JS 写法，
+    Python API 会抛 "Invalid GeoJSON geometry."）。
     """
     src = Path(local_path)
     if not src.is_file():
@@ -310,7 +318,10 @@ def _wait_for_asset(asset_id: str, *, timeout: float = _ASSET_WAIT_TIMEOUT) -> N
             return
         except Exception as exc:  # noqa: BLE001
             last_err = exc
-            time.sleep(_ASSET_WAIT_INTERVAL)
+            # 等待期间没有请求要发出去，让出进程级 GEE 锁，
+            # 否则一次导出会把其它 GEE 任务堵在"提交 GEE 任务"。
+            with gee_idle():
+                time.sleep(_ASSET_WAIT_INTERVAL)
     raise TimeoutError(
         f"GEE 资产导出超时（>{int(timeout)}s）：{asset_id}; last={last_err}"
     )
@@ -378,8 +389,18 @@ def run(
         params.get("gee_project_id")
         or params.get("gee_project")
         or os.environ.get("EE_PROJECT")
-        or "sodium-ray-505904-i3"
     )
+    if not project:
+        # 不再兜底到某个历史项目：静默用一个用户没选过的项目发起 GEE 请求，
+        # 正是「报错里出现一个我没填过的项目名」这类问题的来源；宁可明确失败。
+        return make_result(
+            status="failed",
+            result_type="json",
+            message=(
+                "缺少 GEE 项目 ID：请在『GEE 项目 ID』字段填写，"
+                "或设置环境变量 EE_PROJECT。"
+            ),
+        )
     try:
         initialize_ee(project)
     except GeeAuthRequired as exc:
@@ -414,9 +435,17 @@ def run(
         # 避免用户粘贴错 ID 后白等 30 分钟才发现任务失败。
         try:
             ee.data.getAsset(samples_asset_id)
-        except GeeAuthRequired:
-            raise
         except Exception as exc:  # noqa: BLE001
+            # 认证不匹配时 GEE 报的也是权限错误（见 gee_auth 模块说明：
+            # ee.Initialize 不做网络往返，不匹配只在第一次真实调用暴露）。
+            # 先翻译成 GeeAuthRequired，run() 外层的 except 会转成
+            # 带 `earthengine authenticate --force` 的可执行提示。
+            if is_auth_mismatch_error(exc):
+                return make_result(
+                    status="failed",
+                    result_type="json",
+                    message=str(GeeAuthRequired(project)),
+                )
             return make_result(
                 status="failed",
                 result_type="json",
@@ -438,6 +467,10 @@ def run(
         except FileNotFoundError as exc:
             return make_result(status="failed", result_type="json", message=str(exc))
         except ValueError as exc:
+            return make_result(status="failed", result_type="json", message=str(exc))
+        except GeeAuthRequired as exc:
+            # 保留原文（前端按固定前缀识别并弹"重新认证"按钮），不要拼接
+            # "样本点上传到 GEE 失败：" 前缀，否则前缀被埋掉就识别不到了。
             return make_result(status="failed", result_type="json", message=str(exc))
         except RuntimeError as exc:
             return make_result(status="failed", result_type="json", message=str(exc))
@@ -478,7 +511,7 @@ def run(
         params.get("export_description") or f"TimeSeriesFeatures_{year}"
     )
 
-    sample_points = ee.FeatureCollection(sample_asset_ids).flatten()
+    sample_points = ingest_service.fc_from_asset_ids(sample_asset_ids)
     # ROI 直接来自样本点几何范围（无需单独上传研究区）。
     roi_bounds = sample_points.geometry()
 
@@ -628,6 +661,21 @@ def finalize(
         # Defensive: nothing to wait on, nothing to download.
         return None
 
+    # ----- 0. 把 EE 切回本任务自己的项目（必须在任何 GEE 调用之前）-----
+    # ee 的项目绑定是**进程全局**的，一个 FastAPI 进程里所有算法共享。finalize
+    # 由后台轮询线程触发，往往在提交本任务的 run() 结束很久之后才跑，这期间
+    # 别的算法 / 别的 job 已经把绑定改成了它们的项目。不在这里显式切回来，下面
+    # 的 getAsset / CSV 下载就会带着别人的项目号发出去，用户在界面上看到的是
+    # "Caller does not have required permission to use project <别的项目>"
+    # —— 一个和他自己填的项目毫无关系的名字。
+    project = project_for_job(job)
+    if not project:
+        raise RuntimeError(
+            "无法从任务参数或结果中解析出该任务的 GEE 项目 ID，"
+            f"拒绝在未知项目下访问 GEE。asset={asset_id}"
+        )
+    initialize_ee(project)  # 失败时抛 GeeAuthRequired，由 job_service 翻译成中文
+
     # ``progress_callback`` is wired through for symmetry with ``run``;
     # in practice the worker thread has exited by the time finalize runs,
     # so callers should also write transient messages to the DB via the
@@ -652,7 +700,11 @@ def finalize(
 
     return make_result(
         status="completed",
-        result_type="csv",
+        # result_type 置空：前端 ResultRenderer 的 header 条件是
+        # `resultType || hasMessage`，两者都空时整个 header（含 result_type
+        # 映射出的「CSV 结果」标题）不渲染。CSV 表格预览/下载走的是 files +
+        # csvPreviews，不依赖 result_type，所以不受影响。
+        result_type="",
         files=[
             {
                 "name": local_csv_name,
@@ -683,12 +735,9 @@ def finalize(
                 ),
             ],
         },
-        message=(
-            f"GEE 时序特征导出完成（asset={asset_id}）；"
-            f"年份={metrics.get('year', '')}, 特征数={metrics.get('feature_count', '')}, "
-            f"样本点 Asset={metrics.get('sample_asset_id', '')}, "
-            f"输出 {local_csv_name} ({size_bytes} B)"
-        ),
+        # 不传 message：前端 hasMessage 为 false，header 里的灰色副标题
+        # （就是"GEE 时序特征导出完成…"那行小字）不会渲染。CSV 文件名/大小
+        # 已在下方"CSV 表格预览"和"下载结果文件"区块里展示，信息不丢失。
     )
 
 

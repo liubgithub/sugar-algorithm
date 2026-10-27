@@ -1,24 +1,6 @@
 <template>
   <div class="threshold-result">
-    <!-- ① 任务信息 -->
-    <div class="card info-card">
-      <h3 class="info-card__title">任务信息</h3>
-      <div class="info-card__grid">
-        <div><span class="info-card__label">计算状态</span><span class="info-card__value">{{ statusLabel }}</span></div>
-        <div><span class="info-card__label">GEE 项目</span><span class="info-card__value">{{ geeProject || '—' }}</span></div>
-        <div>
-          <span class="info-card__label">研究区</span>
-          <span class="info-card__value" :title="roiTooltip">{{ roiName }}</span>
-          <small v-if="roiLocalName" class="info-card__sub">
-            （来自本地文件：{{ roiLocalName }}）
-          </small>
-        </div>
-        <div><span class="info-card__label">数据年份</span><span class="info-card__value">{{ year ?? '—' }}</span></div>
-      </div>
-      <p v-if="jobMessage" class="info-card__message">{{ jobMessage }}</p>
-    </div>
-
-    <!-- ② 动态特征范围表 -->
+    <!-- ① 动态特征范围表 -->
     <div class="card">
       <h3 class="card__title">动态特征范围</h3>
       <table class="range-table">
@@ -39,7 +21,7 @@
       </table>
     </div>
 
-    <!-- ③ 醒目提醒卡片 -->
+    <!-- ② 醒目提醒卡片 -->
     <div class="card warning-card">
       <div class="warning-card__icon" aria-hidden="true">⚠️</div>
       <div class="warning-card__body">
@@ -51,7 +33,7 @@
       </div>
     </div>
 
-    <!-- ④ min_values 复制块 -->
+    <!-- ③ min_values 复制块 -->
     <div class="card code-card">
       <div class="code-card__header">
         <h3 class="code-card__title">min_values — 填写位置</h3>
@@ -70,7 +52,7 @@
       <pre class="code-block"><code>{{ minValuesCode }}</code></pre>
     </div>
 
-    <!-- ⑤ max_values 复制块 -->
+    <!-- ④ max_values 复制块 -->
     <div class="card code-card">
       <div class="code-card__header">
         <h3 class="code-card__title">max_values — 填写位置</h3>
@@ -89,7 +71,7 @@
       <pre class="code-block"><code>{{ maxValuesCode }}</code></pre>
     </div>
 
-    <!-- ⑦ DEM 参数 -->
+    <!-- ⑤ DEM 参数 -->
     <div class="card code-card">
       <div class="code-card__header">
         <h3 class="code-card__title">DEM 参数 — 填写位置</h3>
@@ -134,7 +116,7 @@
       </div>
     </div>
 
-    <!-- ⑧ 一键复制全部 -->
+    <!-- ⑥ 一键复制全部 -->
     <div class="card copy-all-card">
       <button
         type="button"
@@ -149,7 +131,7 @@
       </p>
     </div>
 
-    <!-- ⑨ 再次运行 -->
+    <!-- ⑦ 再次运行 -->
     <div class="card rerun-card">
       <router-link
         :to="{ name: 'algorithm-detail', params: { id: 'crop_threshold' } }"

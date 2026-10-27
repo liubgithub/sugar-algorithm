@@ -56,7 +56,14 @@ import ee
 from app.algorithms.base import ProgressCallback, make_card, make_result
 from app.algorithms.crop_classification import configs as cfg
 from app.services import ingest_service
-from app.services.gee_auth import GeeAuthRequired, initialize_ee
+from app.services.gee_auth import (
+    GeeAuthRequired,
+    gee_idle,
+    initialize_ee,
+    project_for_job,
+    raise_if_auth_mismatch,
+)
+from app.services.raster_shards import split_raster_into_shards
 from app.storage import job_store
 
 
@@ -295,7 +302,11 @@ def _wait_for_asset(asset_id: str, *, timeout: float = _ASSET_WAIT_TIMEOUT) -> N
             return
         except Exception as exc:  # noqa: BLE001
             last_err = exc
-            time.sleep(_ASSET_WAIT_INTERVAL)
+            # 等的是 GEE 服务端出图，这段时间没有请求要发出去。
+            # 把进程级 GEE 锁让出来给别的任务用，否则一次导出可能
+            # 长达半小时，其它 GEE 任务会一直卡在"提交 GEE 任务"。
+            with gee_idle():
+                time.sleep(_ASSET_WAIT_INTERVAL)
     raise TimeoutError(
         f"GEE 资产导出超时（>{int(timeout)}s）：{asset_id}; last={last_err}"
     )
@@ -308,26 +319,64 @@ def _download_asset_to_local(
     scale: int,
     crs: str,
     region: ee.Geometry,
-) -> None:
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Dict[str, Any]:
     """Stream a GEE Asset Image to a local GeoTIFF.
 
-    Wraps ``geemap.ee_export_image`` (which handles both the
-    ``getDownloadURL`` fast path for small images and the chunked tiling
-    path for large ones). Destination directory is created on demand.
+    Uses the shared tiled downloader (``app.services.gee_raster``) rather
+    than ``geemap.ee_export_image``.  The latter issues a *single*
+    ``getDownloadURL`` request, and GEE caps one request at 32768 px per
+    side / 48 MiB — a province-wide classification export (Guangxi is
+    ~5 G pixels at 10 m) blows straight through that limit and the
+    download fails with
+
+        Pixel grid dimensions (...) must be less than or equal to 32768
+
+    The tiled downloader fetches the asset on its own exported pixel grid
+    and stitches the pieces back together.  Destination directory is
+    created on demand.
     """
-    import geemap  # type: ignore
+    from app.services.gee_raster import download_asset_to_geotiff
 
-    out_dir = os.path.dirname(os.path.abspath(local_path))
-    os.makedirs(out_dir, exist_ok=True)
-
-    geemap.ee_export_image(
-        ee_object=ee.Image(asset_id),
-        filename=local_path,
-        scale=scale,
-        crs=crs,
-        region=region,
-        file_per_band=False,
+    return download_asset_to_geotiff(
+        asset_id,
+        local_path,
+        progress_callback=progress_callback,
     )
+
+
+def _write_class_sidecar(job_dir: str, tif_name: str) -> Optional[str]:
+    """Write the ``<tif>.metadata.json`` class-label sidecar next to a raster.
+
+    ``preview_service`` reads this file and exposes the business semantics
+    (10=甘蔗 / 20=水稻 / 30=桉树 / 40=其他作物 / 50=背景) on the frontend
+    preview legend instead of a bare "类别 10 / 类别 20 …".
+
+    Every shard needs its own sidecar — the mosaic pipeline reads the
+    sidecar of each file it stitches and merges them (first one wins).
+
+    Best-effort: a missing sidecar must never fail the whole job.
+    """
+    sidecar_path = os.path.abspath(
+        os.path.join(job_dir, tif_name + cfg.CLASS_METADATA_SUFFIX)
+    )
+    sidecar_payload = {
+        "schema_version": 1,
+        "filename": tif_name,
+        "class_labels": {str(k): v for k, v in cfg.CLASS_LABELS.items()},
+        "class_colors": {str(k): v for k, v in cfg.CLASS_COLORS.items()},
+    }
+    try:
+        with open(sidecar_path, "w", encoding="utf-8") as fh:
+            json.dump(sidecar_payload, fh, ensure_ascii=False, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[crop_classification] failed to write class metadata sidecar "
+            f"({sidecar_path}): {exc}",
+            file=sys.stderr,
+        )
+        return None
+    return sidecar_path
 
 
 def _ingest_local(
@@ -347,7 +396,10 @@ def _ingest_local(
     provided. A single-element list ``[id]`` means a single Asset; a
     multi-element list means the source file was chunked because GEE's
     ``Export.table.toAsset`` 10 MB cap couldn't fit it in one shot —
-    callers must ``ee.FeatureCollection(ids).flatten()`` at use time.
+    callers must build the FC via
+    ``ingest_service.fc_from_asset_ids(ids)`` at use time (NOT
+    ``ee.FeatureCollection(ids)``, which is the JS idiom and raises
+    "Invalid GeoJSON geometry." in the Python API).
 
     Precedence:
       1. ``asset_id`` provided → wrap in a one-element list (with one
@@ -368,9 +420,11 @@ def _ingest_local(
     if asset_id:
         try:
             ee.data.getAsset(asset_id)
-        except GeeAuthRequired:
-            raise
         except Exception as exc:  # noqa: BLE001
+            # 权限不足会走到这里（ee.Initialize 不做网络往返，认证不匹配
+            # 只在第一次真实 API 调用时才暴露）。翻译成 GeeAuthRequired，
+            # 让前端弹出"重新认证"提示，而不是让用户误以为 Asset 不存在。
+            raise_if_auth_mismatch(exc, project)
             raise RuntimeError(
                 f"无法访问 GEE {label} Asset：{asset_id}。"
                 f"请确认 Asset 存在、属于当前项目 ({project})，且您有读取权限。"
@@ -446,10 +500,18 @@ def run(
     # ----- 1. GEE init -----
     project = (
         params.get("gee_project_id")
-        or params.get("gee_project")
-        or os.environ.get("EE_PROJECT")
-        or "sodium-ray-505904-i3"
     )
+    print(f"[crop_classification] run() project param = {project!r}", file=sys.stderr)
+    if not project:
+        return make_result(
+            status="failed",
+            result_type="json",
+            message=(
+                "缺少 GEE 项目 ID：请在『GEE 项目 ID』字段填写。"
+                "该算法不会替你猜一个项目 —— ee 的项目绑定是后端进程全局的，"
+                "猜错会让请求带着你没选过的项目号发出去。"
+            ),
+        )
     try:
         initialize_ee(project)
     except GeeAuthRequired as exc:
@@ -489,6 +551,18 @@ def run(
             status="failed",
             result_type="json",
             message=f"Sentinel-2 最大云量必须在 0~100 之间：{cloud_pct_max}",
+        )
+    # 结果分片数：切成 N 个独立的 GeoTIFF，拼接起来才是完整结果。
+    # 见 cfg.DEFAULT_SHARD_COUNT 的说明。
+    try:
+        shard_count = int(params.get("shard_count", cfg.DEFAULT_SHARD_COUNT))
+    except (TypeError, ValueError):
+        shard_count = cfg.DEFAULT_SHARD_COUNT
+    if shard_count < 1:
+        return make_result(
+            status="failed",
+            result_type="json",
+            message=f"结果分片数必须 ≥ 1：{shard_count}",
         )
 
     # ----- 3. 研究区解析（asset / 本地 / 历史文件） -----
@@ -558,7 +632,10 @@ def run(
         )
 
     # chunked 上传会返回多个 asset id；用 flatten() 服务端一次性合并。
-    roi = ee.FeatureCollection(roi_asset_ids).flatten()
+    # 注意必须走 ingest_service.fc_from_asset_ids —— 直接
+    # ee.FeatureCollection(<list[str]>) 是 JS 写法，在 Python API 里会把
+    # 资产 id 当几何解析并抛 "Invalid GeoJSON geometry."。
+    roi = ingest_service.fc_from_asset_ids(roi_asset_ids)
     roi_bounds = roi.geometry()
 
     # ----- 5. 构建 12 月时序特征 + DEM -----
@@ -570,7 +647,7 @@ def run(
     )
 
     # ----- 5.b 样本点预处理：防御性类型转换 + 清洗 -----
-    sample_points = ee.FeatureCollection(samples_asset_ids).flatten()
+    sample_points = ingest_service.fc_from_asset_ids(samples_asset_ids)
 
     # 源样本 FC（用户上传的 CSV/GeoJSON，或 crop_features 生成的产物）中
     # class 列常常是 String（"10"），甚至单 FC 内 Integer 与 String 混存。
@@ -676,15 +753,11 @@ def run(
 
     # ----- 8. 返回 submitted（Pattern B） -----
     cards = [
-        make_card("task_status", "任务状态", "已提交 GEE", ""),
         make_card("year", "目标年份", year, "年"),
         make_card("overall_accuracy", "总体精度 (OA)", round(oa, 4), ""),
         make_card("kappa", "Kappa 系数", round(kappa, 4), ""),
         make_card("num_trees", "RandomForest 树数", num_trees, ""),
         make_card("train_ratio", "训练集比例", f"{train_ratio:.0%}", ""),
-        make_card("gee_task_id", "GEE 任务 ID", gee_task_id or "", ""),
-        make_card("asset_id", "GEE 资产", asset_id, ""),
-        make_card("output_tif", "输出文件", output_tif_name, ""),
     ]
 
     return make_result(
@@ -701,6 +774,7 @@ def run(
             "train_ratio": train_ratio,
             "label_property": label_property,
             "cloud_pct_max": cloud_pct_max,
+            "shard_count": shard_count,
             "asset_id": asset_id,
             "description": unique_description,
             "output_tif_name": output_tif_name,
@@ -733,8 +807,11 @@ def finalize(
       2. Wait until the GEE Asset is queryable, up to
          ``_FINALIZE_WAIT_TIMEOUT`` (30 minutes).
       3. Download the Asset as GeoTIFF into ``job_dir/<output_tif_name>``
-         via ``geemap.ee_export_image``.
-      4. Build and return the new ``make_result`` payload; the poller
+         via the tiled downloader (``app.services.gee_raster``).
+      4. Cut the downloaded raster into ``shard_count`` independent GeoTIFFs
+         (each one a shard of the same map, sharing a ``group``) and write
+         the class-label sidecar for every shard.
+      5. Build and return the new ``make_result`` payload; the poller
          writes it to the job store.
 
     Raises on any failure so the poller can mark the job as ``failed``
@@ -752,6 +829,22 @@ def finalize(
     if not asset_id or not description:
         return None
 
+    # ----- 0. 把 EE 切回本任务自己的项目（必须在任何 GEE 调用之前）-----
+    # ee 的项目绑定是**进程全局**的，一个 FastAPI 进程里所有算法共享。finalize
+    # 由后台轮询线程触发，往往在提交本任务的 run() 结束很久之后才跑，这期间
+    # 别的算法 / 别的 job 已经把绑定改成了它们的项目。不在这里显式切回来，下面
+    # 的 getAsset / geemap 下载就会带着别人的项目号发出去，用户在界面上看到
+    # 的是 "Caller does not have required permission to use project <别的项目>"
+    # —— 一个和他自己填的项目毫无关系的名字。重新认证治不好这个，因为问题不在
+    # 凭据，在于发请求时用错了项目。
+    project = project_for_job(job)
+    if not project:
+        raise RuntimeError(
+            "无法从任务参数或结果中解析出该任务的 GEE 项目 ID，"
+            f"拒绝在未知项目下访问 GEE。asset={asset_id}"
+        )
+    initialize_ee(project)  # 失败时抛 GeeAuthRequired，由 job_service 翻译成中文
+
     # 重新拿一次 roi_asset_ids 用于下载 region；job.params 可能已被清理，
     # 但 metrics 里已经留了。优先读新格式 (List[str])，回退到旧格式 (str)。
     roi_asset_ids_finalize = metrics.get("roi_asset_ids")
@@ -767,7 +860,7 @@ def finalize(
             region = None
     else:
         try:
-            roi = ee.FeatureCollection(roi_asset_ids_finalize).flatten()
+            roi = ingest_service.fc_from_asset_ids(roi_asset_ids_finalize)
             region = roi.geometry()
         except Exception:
             region = None
@@ -788,6 +881,11 @@ def finalize(
     if progress_callback:
         progress_callback(90, "下载分类结果 GeoTIFF 到本地")
 
+    # 下载器自己报 0→100；这里映射到 90→99 的区间，避免进度条往回跳。
+    def _download_progress(pct: int, message: str) -> None:
+        if progress_callback:
+            progress_callback(90 + int(9 * max(0, min(100, pct)) / 100), message)
+
     local_tif_path = os.path.abspath(os.path.join(job_dir, output_tif_name))
     if region is None:
         # 兜底：不带 region 下载（geemap 会用整张图的 footprint）。
@@ -797,6 +895,7 @@ def finalize(
             scale=cfg.EXPORT_SCALE,
             crs=cfg.EXPORT_CRS,
             region=None,  # type: ignore[arg-type]
+            progress_callback=_download_progress,
         )
     else:
         _download_asset_to_local(
@@ -805,45 +904,110 @@ def finalize(
             scale=cfg.EXPORT_SCALE,
             crs=cfg.EXPORT_CRS,
             region=region,
+            progress_callback=_download_progress,
         )
 
     if not os.path.isfile(local_tif_path):
         raise RuntimeError(
             f"GEE 资产下载完成但未找到本地文件：{local_tif_path}。"
-            f"请检查 geemap.ee_export_image 输出目录配置。"
+            f"请检查 GEE 资产下载输出目录配置。"
+        )
+
+    return build_completed_result(
+        job, job_dir, progress_callback=progress_callback
+    )
+
+
+def build_completed_result(
+    job: Dict[str, Any],
+    job_dir: str,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Dict[str, Any]:
+    """Build the ``completed`` result payload from the files already on disk.
+
+    Split out of :func:`finalize` so the result can be published **without
+    re-downloading** the raster.  ``finalize`` = download + this; when a
+    download has already been completed out-of-band (e.g. by
+    ``scripts/download_gee_asset.py``, which is resumable), calling this
+    directly turns the on-disk GeoTIFF into a finished job in seconds
+    instead of re-fetching 315 tiles.
+    """
+    result = (job or {}).get("result") or {}
+    metrics = result.get("metrics") or {}
+    asset_id = metrics.get("asset_id")
+    description = metrics.get("description")
+    output_tif_name = (
+        metrics.get("output_tif_name")
+        or (f"{description}.tif" if description else None)
+        or "crop_classification.tif"
+    )
+    local_tif_path = os.path.abspath(os.path.join(job_dir, output_tif_name))
+    if not os.path.isfile(local_tif_path):
+        raise RuntimeError(
+            f"找不到本地结果文件：{local_tif_path}。"
+            f"请先下载 GEE 资产再发布结果。"
         )
 
     # 写入分类元数据 sidecar —— preview_service 会读这个文件把
     # 10→甘蔗 / 20→水稻 / 30→桉树 / 40→其他作物 / 50→背景 这样的中文标签
     # 暴露到前端图例，而不是只显示“类别 10/20/...”。失败 best-effort：
     # 写不出来也不应该让整次任务失败。
-    sidecar_path = os.path.abspath(
-        os.path.join(job_dir, output_tif_name + cfg.CLASS_METADATA_SUFFIX)
-    )
-    sidecar_payload = {
-        "schema_version": 1,
-        "filename": output_tif_name,
-        "class_labels": {str(k): v for k, v in cfg.CLASS_LABELS.items()},
-        "class_colors": {str(k): v for k, v in cfg.CLASS_COLORS.items()},
-    }
-    try:
-        with open(sidecar_path, "w", encoding="utf-8") as fh:
-            json.dump(sidecar_payload, fh, ensure_ascii=False, indent=2)
-    except Exception as exc:  # noqa: BLE001
-        print(
-            f"[crop_classification] failed to write class metadata sidecar "
-            f"({sidecar_path}): {exc}",
-            file=sys.stderr,
+    #
+    # 分片模式下每个分片都要有自己的 sidecar（拼接时逐个读取、合并）。
+    shard_count = int(metrics.get("shard_count") or 1)
+    file_entries: List[Dict[str, Any]] = []
+    shard_names: List[str] = []
+
+    if shard_count > 1:
+        # 切成若干独立的 GeoTIFF。它们各自是一个完整的栅格文件，但只有
+        # 拼起来才是完整地图 —— 与算法在本地运行时的产物形态一致。
+        # 前端按 files[].group 把同一组的分片拼成一张图展示。
+        if progress_callback:
+            # 下载阶段已经报到 99，这里不能再往回退。
+            progress_callback(99, f"正在把分类结果切成 {shard_count} 个分片")
+        try:
+            shards = split_raster_into_shards(
+                local_tif_path,
+                out_dir=job_dir,
+                base_name=os.path.splitext(output_tif_name)[0],
+                num_shards=shard_count,
+                remove_source=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"分类结果分片失败：{exc}") from exc
+
+        for shard in shards:
+            _write_class_sidecar(job_dir, shard["name"])
+            shard_names.append(shard["name"])
+            file_entries.append(
+                {
+                    "name": shard["name"],
+                    "label": "classification",
+                    # 同一个 group 的文件会被拼成一张图
+                    "group": "classification",
+                    "path": shard["path"],
+                    "size_bytes": shard["size_bytes"],
+                }
+            )
+    else:
+        _write_class_sidecar(job_dir, output_tif_name)
+        shard_names.append(output_tif_name)
+        file_entries.append(
+            {
+                "name": output_tif_name,
+                "label": "classification",
+                "path": local_tif_path,
+                "size_bytes": os.path.getsize(local_tif_path),
+            }
         )
 
-    size_bytes = os.path.getsize(local_tif_path)
+    size_bytes = sum(int(f.get("size_bytes") or 0) for f in file_entries)
 
     if progress_callback:
         progress_callback(100, "GEE 作物分类完成")
 
     # 保留 run() 里拿到的指标 + 加 output 信息 + 重新生成 cards。
     new_cards = [
-        make_card("task_status", "任务状态", "完成", ""),
         make_card("year", "目标年份", metrics.get("year", ""), "年"),
         make_card(
             "overall_accuracy",
@@ -861,36 +1025,32 @@ def finalize(
             f"{(metrics.get('train_ratio') or 0):.0%}" if metrics.get("train_ratio") is not None else "",
             "",
         ),
-        make_card(
-            "gee_task_id", "GEE 任务 ID", metrics.get("gee_task_id", "") or "", ""
-        ),
-        make_card("asset_id", "GEE 资产", asset_id, ""),
-        make_card("output_tif", "输出文件", output_tif_name, ""),
     ]
+
+    # 任务 id 是 run() 阶段从 GEE 拿到的，completed 的载荷必须继续带着它 ——
+    # 否则 finalize 之后任务详情里就再也看不到是哪一个 GEE 任务了。
+    gee_task_id = result.get("gee_task_id") or metrics.get("gee_task_id") or ""
 
     return make_result(
         status="completed",
         result_type="raster",
-        files=[
-            {
-                "name": output_tif_name,
-                "label": "classification",
-                "path": local_tif_path,
-                "size_bytes": size_bytes,
-            }
-        ],
+        files=file_entries,
+        gee_task_id=gee_task_id or None,
         metrics={
             **metrics,
             "output_tif": output_tif_name,
+            "shard_names": shard_names,
+            "shard_count": len(shard_names),
             "cards": new_cards,
         },
         message=(
-            f"GEE 作物分类完成（task_id={metrics.get('gee_task_id', '')}，"
+            f"GEE 作物分类完成（task_id={gee_task_id}，"
             f"asset={asset_id}，年份={metrics.get('year', '')}，"
             f"OA={metrics.get('oa', 0):.4f}，Kappa={metrics.get('kappa', 0):.4f}，"
-            f"输出 {output_tif_name} {size_bytes} B）"
+            f"输出 {len(shard_names)} 个分片：{'、'.join(shard_names)}，"
+            f"合计 {size_bytes} B）"
         ),
     )
 
 
-__all__ = ["run", "finalize"]
+__all__ = ["run", "finalize", "build_completed_result"]

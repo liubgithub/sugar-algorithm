@@ -36,6 +36,14 @@ class JobCancelResponse(BaseModel):
     status: str
 
 
+class JobRetryResponse(BaseModel):
+    """Result of POST /api/jobs/{id}/retry."""
+
+    job_id: str
+    status: str
+    message: str = ""
+
+
 class JobStatusResponse(BaseModel):
     job_id: str
     algorithm: str

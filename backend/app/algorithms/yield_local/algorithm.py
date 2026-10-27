@@ -284,24 +284,24 @@ def run(
             "province_county_pred_full_final",
             "全年平均预测面积",
             metrics["province_county_pred_full_final"],
-            "分数",
         ),
-        make_card("train_r2", "训练集 R²", train_metrics.get("R2"), ""),
-        make_card("train_mae", "训练集 MAE", train_metrics.get("MAE"), "分数"),
+        # R² / MAE / Ridge α 都是无量纲的"分值/比值"型指标，不需要单位一列：
+        # 显式不传 unit（默认 None → make_card 落空串 ""），与前端 v-if="card.unit"
+        # 共同作用，确保这些卡片不渲染任何单位文案。
+        make_card("train_r2", "训练集 R²", train_metrics.get("R2")),
+        make_card("train_mae", "训练集 MAE", train_metrics.get("MAE")),
         make_card(
             "folded_formula_full_final",
             "折叠公式省级值",
             metrics["folded_formula_full_final"],
-            "分数",
         ),
         make_card(
             "province_actual_final",
             "省级实际结果",
             metrics["province_actual_final"],
-            "分数",
         ),
         make_card(
-            "ridge_alpha", "Ridge α", float(model_result["model"].named_steps["ridgecv"].alpha_), ""
+            "ridge_alpha", "Ridge α", float(model_result["model"].named_steps["ridgecv"].alpha_)
         ),
         make_card("valid_pixel_count", "有效像元数", valid_pixel_count, "个"),
     ]

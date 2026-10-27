@@ -46,21 +46,26 @@
              的 str()，里头包含 `earthengine authenticate --force` 命令。
              渲染成预格式化块保留换行，并提供"复制命令"按钮方便用户直接
              粘贴到本机终端执行。 -->
-        <div
+        <GeeAuthHint
           v-if="job.status === 'failed' && geeAuthHint"
-          class="gee-auth-hint"
-        >
-          <pre class="gee-auth-hint__msg">{{ job.message }}</pre>
+          :message="job.message"
+        />
+
+        <!-- 重新拉取：GEE 侧的任务其实已经跑完，只是最后一步（等 Asset +
+             下载 GeoTIFF）挂了 —— 最常见的原因是本机代理抽风。后端会重新
+             触发 finalize，已下载的图块断点续传，不用从头再来。 -->
+        <div v-if="canRetry" style="margin-top: 10px;">
           <button
-            class="button button--ghost"
+            class="button"
             type="button"
-            style="padding: 2px 10px; font-size: 12px;"
-            @click="onCopyGeeAuthCommand"
-          >复制命令</button>
-          <span
-            v-if="copyFeedback"
-            class="gee-auth-hint__copy-feedback"
-          >已复制</span>
+            :disabled="retrying"
+            @click="onRetry"
+          >
+            {{ retrying ? '正在重新拉取…' : '重新拉取结果' }}
+          </button>
+          <span style="margin-left: 8px; font-size: 12px; color: var(--color-muted);">
+            GEE 上已有结果，只需重新下载到本地（断点续传）
+          </span>
         </div>
 
         <div class="job-meta">
@@ -132,9 +137,11 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { fetchJob, fetchJobLog, patchJob } from '../api/jobs'
+import { fetchJob, fetchJobLog, patchJob, retryJob } from '../api/jobs'
+import GeeAuthHint from '../components/GeeAuthHint.vue'
 import ResultRenderer from '../components/ResultRenderer.vue'
 import ThresholdResult from '../components/ThresholdResult.vue'
+import { isGeeAuthMessage } from '../utils/geeAuth'
 
 // 这两个算法 ID 都属于"GEE 动态阈值计算"类，结果结构一致（band_names + min/max_values + dem_min/max）。
 // 后续若新增同类算法，只要往这里加 ID 即可复用 ThresholdResult。
@@ -178,6 +185,7 @@ const job = ref(null)
 const error = ref('')
 const logText = ref('')
 const logOffset = ref(0)
+const retrying = ref(false)
 let timer = null
 
 const STATUS_LABELS = {
@@ -200,42 +208,29 @@ const isThresholdAlgorithm = computed(() =>
 )
 
 // 后端 GeeAuthRequired 异常的固定前缀（见 backend/app/services/gee_auth.py）。
-// 命中即说明后端提示用户在本机重新认证。
-const GEE_AUTH_HINT_PREFIX = '当前 GEE 认证与请求项目'
-const geeAuthHint = computed(() => {
-  const msg = job.value?.message || ''
-  return msg.startsWith(GEE_AUTH_HINT_PREFIX)
-})
+// 命中即说明后端提示用户在本机重新认证。识别规则与提示块本身都搬到了
+// ../utils/geeAuth.js + components/GeeAuthHint.vue，表单页（AlgorithmDetailView）
+// 的提交前校验也复用同一套逻辑。
+const geeAuthHint = computed(() => isGeeAuthMessage(job.value?.message))
 
-const copyFeedback = ref(false)
-let copyFeedbackTimer = null
+// 只有失败 / 已取消的任务可以重试；后端还会再校验一次"能不能重试"
+// （GEE 侧必须已经留下 asset_id，或者需要整单重提）。
+const canRetry = computed(() =>
+  ['failed', 'cancelled'].includes(job.value?.status || '') && !retrying.value
+)
 
-// GeeAuthRequired 的提示文案里包含形如 `    earthengine authenticate --force`
-// 的命令（带缩进）。把它解析出来便于"复制命令"按钮一键复制。
-const GEE_AUTH_COMMAND_LINE = 'earthengine authenticate --force'
-
-async function onCopyGeeAuthCommand() {
+async function onRetry() {
+  if (!job.value) return
+  retrying.value = true
   try {
-    if (navigator?.clipboard?.writeText) {
-      await navigator.clipboard.writeText(GEE_AUTH_COMMAND_LINE)
-    } else {
-      // 兜底：临时 textarea + execCommand，仅在不支持 Clipboard API 的浏览器触发。
-      const ta = document.createElement('textarea')
-      ta.value = GEE_AUTH_COMMAND_LINE
-      ta.style.position = 'fixed'
-      ta.style.opacity = '0'
-      document.body.appendChild(ta)
-      ta.select()
-      document.execCommand('copy')
-      document.body.removeChild(ta)
-    }
-    copyFeedback.value = true
-    if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer)
-    copyFeedbackTimer = setTimeout(() => {
-      copyFeedback.value = false
-    }, 1800)
+    await retryJob(jobId)
+    job.value = await fetchJob(jobId)
+    // 任务回到非终态，恢复轮询，让进度条跟着下载走。
+    startPolling()
   } catch (err) {
-    console.error('复制失败', err)
+    window.alert('重新拉取失败：' + (err.userMessage || err.message))
+  } finally {
+    retrying.value = false
   }
 }
 
@@ -307,21 +302,26 @@ async function load() {
   }
 }
 
-onMounted(() => {
-  load()
+function startPolling() {
+  if (timer) clearInterval(timer)
   timer = setInterval(() => {
     if (job.value && ['completed', 'failed', 'cancelled'].includes(job.value.status)) {
       clearInterval(timer)
+      timer = null
       refreshLog() // 任务结束前再拉一次，收尾剩余日志
       return
     }
     load()
   }, 1500)
+}
+
+onMounted(() => {
+  load()
+  startPolling()
 })
 
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer)
-  if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer)
 })
 </script>
 
@@ -347,18 +347,7 @@ onBeforeUnmount(() => {
 }
 .button--ghost:hover { background: rgba(37, 99, 235, 0.06); }
 
-.gee-auth-hint {
-  margin-top: 8px;
-  padding: 10px 12px;
-  border-radius: 6px;
-  background: rgba(220, 38, 38, 0.06);
-  border: 1px solid rgba(220, 38, 38, 0.3);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-/* 通用失败错误块：与 gee-auth-hint 视觉一致，但只展示错误文案本身，
+/* 通用失败错误块：与 GeeAuthHint 组件视觉一致，但只展示错误文案本身，
    不提供复制命令。用于 GEE 任务原始 error_message（GEE 状态码、CSV
    字段缺失、Asset 不可访问等）。 */
 .gee-error-block {
@@ -384,19 +373,5 @@ onBeforeUnmount(() => {
   white-space: pre-wrap;
   word-break: break-word;
   color: var(--color-danger);
-}
-.gee-auth-hint__msg {
-  margin: 0;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 13px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: var(--color-danger);
-}
-.gee-auth-hint__copy-feedback {
-  margin-left: 8px;
-  font-size: 12px;
-  color: var(--color-muted);
 }
 </style>

@@ -32,3 +32,13 @@ export function deleteJob(jobId) {
 export function cancelJob(jobId) {
   return http.post(`/jobs/${jobId}/cancel`).then((r) => r.data)
 }
+
+// Re-pull the result of a failed / cancelled job.
+//
+// Typical case: the GEE task itself succeeded but the *finalize* step
+// (wait for asset + download the GeoTIFF) died — usually a flaky proxy.
+// The backend re-dispatches the finalize hook; already-downloaded tiles
+// are resumed rather than re-fetched.
+export function retryJob(jobId) {
+  return http.post(`/jobs/${jobId}/retry`).then((r) => r.data)
+}

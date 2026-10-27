@@ -1,11 +1,5 @@
 <template>
   <div class="result-renderer">
-    <!-- 顶部：标题 + 副标题（消息） -->
-    <header class="result-renderer__header" v-if="resultType || hasMessage">
-      <h3 class="result-renderer__title">{{ resultTitle }}</h3>
-      <p v-if="hasMessage" class="result-renderer__subtitle">{{ result.message }}</p>
-    </header>
-
     <!-- ① 指标卡 -->
     <section v-if="cards.length" class="result-section">
       <h4 class="result-section__heading">指标</h4>
@@ -44,34 +38,52 @@
       <p v-else class="result-section__empty">无数据。</p>
     </section>
 
-    <!-- ③ 影像（result.files 中的 .tif / .tiff） -->
-    <section v-if="rasters.length" class="result-section">
+    <!-- ③ 影像（result.files 中的 .tif / .tiff）
+         同一个 group 的多个 .tif 是「同一张图切成的分片」，拼起来才是完整
+         结果 —— 这类 group 走 /result/mosaic/* 拼成一张图展示。 -->
+    <section v-if="rasterGroups.length" class="result-section">
       <h4 class="result-section__heading">栅格影像</h4>
-      <div v-for="r in rasters" :key="r.name" class="raster-card">
+      <div v-for="g in rasterGroups" :key="g.key" class="raster-card">
         <div class="raster-card__header">
           <div class="raster-card__title">
-            <span class="raster-card__label" v-if="r.label">{{ r.label }}</span>
-            <code>{{ r.name }}</code>
-            <span class="raster-card__size">{{ formatSize(r.size_bytes) }}</span>
+            <span class="raster-card__label" v-if="g.label">{{ g.label }}</span>
+            <code>{{ g.name }}</code>
+            <span class="raster-card__size">{{ formatSize(g.size_bytes) }}</span>
+            <span v-if="g.isMosaic" class="raster-card__shards">
+              拼接自 {{ g.names.length }} 个分片
+            </span>
           </div>
           <div class="raster-card__actions">
             <button
               type="button"
               class="button button--ghost"
-              @click="openLightbox(r)"
+              @click="openLightbox(g)"
             >🔍 放大预览</button>
             <a
-              :href="r.previewUrl"
+              :href="g.previewUrl"
               target="_blank"
               rel="noopener"
               class="button button--ghost"
             >下载png</a>
             <a
-              :href="r.downloadUrl"
-              :download="r.name"
+              v-if="g.downloadUrl"
+              :href="g.downloadUrl"
+              :download="g.name"
               class="button button--ghost"
             >下载 TIF</a>
           </div>
+        </div>
+
+        <!-- 多分片时列出每个分片，方便单独下载原图 -->
+        <div v-if="g.isMosaic" class="raster-card__shard-list">
+          <span class="raster-card__shard-list-title">分片：</span>
+          <a
+            v-for="f in g.files"
+            :key="f.name"
+            :href="f.downloadUrl"
+            :download="f.name"
+            class="raster-card__shard"
+          >{{ f.name }}</a>
         </div>
 
         <!-- 缩略图（左） + 图例（右） 横向布局 -->
@@ -79,42 +91,42 @@
           <button
             type="button"
             class="raster-card__img-wrap"
-            @click="openLightbox(r)"
-            :title="`点击放大：${r.name}`"
+            @click="openLightbox(g)"
+            :title="`点击放大：${g.name}`"
           >
             <img
-              :src="r.previewUrl"
-              :alt="r.name"
+              :src="g.previewUrl"
+              :alt="g.name"
               class="raster-card__img"
               loading="lazy"
-              @error="onImgError(r.name)"
-              v-show="!imgError[r.name]"
+              @error="onImgError(g.key)"
+              v-show="!imgError[g.key]"
             />
-            <div v-if="imgError[r.name]" class="raster-card__img-error">
+            <div v-if="imgError[g.key]" class="raster-card__img-error">
               图片加载失败
             </div>
           </button>
 
           <!-- 右侧色带图例 -->
           <div class="raster-card__legend">
-            <div v-if="infoMap[r.name]" class="legend">
+            <div v-if="infoMap[g.key]" class="legend">
               <div class="legend__title">
-                <span class="legend__type-badge" :class="`legend__type-badge--${infoMap[r.name].type}`">
-                  {{ typeLabelOf(infoMap[r.name].type) }}
+                <span class="legend__type-badge" :class="`legend__type-badge--${infoMap[g.key].type}`">
+                  {{ typeLabelOf(infoMap[g.key].type) }}
                 </span>
-                <span class="legend__title-text">{{ legendTitleFor(r.name) }}</span>
+                <span class="legend__title-text">{{ legendTitleFor(g) }}</span>
               </div>
 
               <!-- continuous: 渐变色带 + 三档标注 -->
               <div
-                v-if="infoMap[r.name].type === 'continuous'"
+                v-if="infoMap[g.key].type === 'continuous'"
                 class="legend-continuous"
               >
                 <div class="legend-continuous__bar" :style="viridisGradient"></div>
                 <div class="legend-continuous__ticks">
-                  <span>{{ fmtNum(infoMap[r.name].stats.p2) }}</span>
-                  <span>{{ fmtNum(infoMap[r.name].stats.mean) }}</span>
-                  <span>{{ fmtNum(infoMap[r.name].stats.p98) }}</span>
+                  <span>{{ fmtNum(infoMap[g.key].stats.p2) }}</span>
+                  <span>{{ fmtNum(infoMap[g.key].stats.mean) }}</span>
+                  <span>{{ fmtNum(infoMap[g.key].stats.p98) }}</span>
                 </div>
                 <div class="legend-continuous__labels">
                   <span>低</span>
@@ -126,11 +138,11 @@
 
               <!-- binary: 前景 / 背景 两色块 -->
               <div
-                v-else-if="infoMap[r.name].type === 'binary'"
+                v-else-if="infoMap[g.key].type === 'binary'"
                 class="legend-binary"
               >
                 <div
-                  v-for="(color, cls) in infoMap[r.name].classes"
+                  v-for="(color, cls) in infoMap[g.key].classes"
                   :key="cls"
                   class="legend-item"
                 >
@@ -139,7 +151,7 @@
                     {{ cls == 1 || cls == 255 ? '前景（有效）' : '背景（非有效）' }}
                   </span>
                   <span class="legend-item__count">
-                    {{ fmtPx(binaryCountFor(infoMap[r.name], cls)) }}
+                    {{ fmtPx(binaryCountFor(infoMap[g.key], cls)) }}
                   </span>
                 </div>
               </div>
@@ -147,44 +159,46 @@
               <!-- categorical: 每个类别一色块 -->
               <div v-else class="legend-categorical">
                 <div
-                  v-for="(color, cls) in infoMap[r.name].classes"
+                  v-for="(color, cls) in infoMap[g.key].classes"
                   :key="cls"
                   class="legend-item"
                 >
                   <span class="legend-item__swatch" :style="{ background: color }" />
                   <span class="legend-item__label">
-                    {{ categoricalLabelFor(r.name, cls) }}
+                    {{ categoricalLabelFor(infoMap[g.key], cls) }}
                   </span>
                   <span class="legend-item__count">
-                    {{ fmtPx(infoMap[r.name].stats.class_counts?.[cls] ?? 0) }}
+                    {{ fmtPx(infoMap[g.key].stats.class_counts?.[cls] ?? 0) }}
                   </span>
                 </div>
               </div>
             </div>
-            <div v-else class="legend__loading">图例加载中…</div>
+            <div v-else class="legend__loading">
+              {{ infoErrors[g.key] ? `图例加载失败：${infoErrors[g.key]}` : '图例加载中…' }}
+            </div>
           </div>
         </div>
 
         <!-- 像元统计：仅 continuous 显示在缩略图下方 -->
         <div
-          v-if="infoMap[r.name] && infoMap[r.name].type === 'continuous'"
+          v-if="infoMap[g.key] && infoMap[g.key].type === 'continuous'"
           class="raster-card__stats"
         >
           <h4 class="raster-card__stats-heading">像元统计</h4>
           <table class="result-viewer__stats">
             <tbody>
-              <tr><th>min</th><td>{{ fmtNum(infoMap[r.name].stats.min) }}</td></tr>
-              <tr><th>max</th><td>{{ fmtNum(infoMap[r.name].stats.max) }}</td></tr>
-              <tr><th>mean</th><td>{{ fmtNum(infoMap[r.name].stats.mean) }}</td></tr>
-              <tr><th>std</th><td>{{ fmtNum(infoMap[r.name].stats.std) }}</td></tr>
-              <tr><th>p2</th><td>{{ fmtNum(infoMap[r.name].stats.p2) }}</td></tr>
-              <tr><th>p98</th><td>{{ fmtNum(infoMap[r.name].stats.p98) }}</td></tr>
-              <tr v-if="infoMap[r.name].stats.nodata_count">
-                <th>nodata</th><td>{{ infoMap[r.name].stats.nodata_count }} px</td>
+              <tr><th>min</th><td>{{ fmtNum(infoMap[g.key].stats.min) }}</td></tr>
+              <tr><th>max</th><td>{{ fmtNum(infoMap[g.key].stats.max) }}</td></tr>
+              <tr><th>mean</th><td>{{ fmtNum(infoMap[g.key].stats.mean) }}</td></tr>
+              <tr><th>std</th><td>{{ fmtNum(infoMap[g.key].stats.std) }}</td></tr>
+              <tr><th>p2</th><td>{{ fmtNum(infoMap[g.key].stats.p2) }}</td></tr>
+              <tr><th>p98</th><td>{{ fmtNum(infoMap[g.key].stats.p98) }}</td></tr>
+              <tr v-if="infoMap[g.key].stats.nodata_count">
+                <th>nodata</th><td>{{ infoMap[g.key].stats.nodata_count }} px</td>
               </tr>
-              <tr v-if="infoMap[r.name].effective_pixel_ratio != null">
+              <tr v-if="infoMap[g.key].effective_pixel_ratio != null">
                 <th>有效率</th>
-                <td>{{ (infoMap[r.name].effective_pixel_ratio * 100).toFixed(2) }}%</td>
+                <td>{{ (infoMap[g.key].effective_pixel_ratio * 100).toFixed(2) }}%</td>
               </tr>
             </tbody>
           </table>
@@ -261,7 +275,7 @@
               @click="lightboxNext"
             >下一张 ›</button>
             <a
-              v-if="lightboxCurrent"
+              v-if="lightboxCurrent && lightboxCurrent.downloadUrl"
               :href="lightboxCurrent.downloadUrl"
               :download="lightboxCurrent.name"
               class="button button--ghost"
@@ -358,39 +372,27 @@
       <router-link :to="rerunPath" class="button">再运行一次</router-link>
     </div>
 
-    <!-- 兜底：所有 section 都为空且没有 message -->
+    <!-- 兜底：所有 section 都为空（消息由任务信息卡单独展示，这里不重复） -->
     <p v-if="isEmpty" class="result-renderer__empty">
-      任务已完成，但未返回任何结构化结果。
+      {{ emptyHint }}
     </p>
   </div>
 </template>
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, watch } from 'vue'
-import { fetchJobInfo, jobFileUrl, jobPreviewUrl } from '../api/jobFiles'
+import {
+  fetchJobInfo,
+  fetchJobMosaicInfo,
+  jobFileUrl,
+  jobMosaicPreviewUrl,
+  jobPreviewUrl
+} from '../api/jobFiles'
 
 const props = defineProps({
   jobId: { type: String, required: true },
   algorithm: { type: String, default: '' },
   result: { type: Object, default: () => ({}) }
-})
-
-// ----------------------------------------------------------------
-// 顶部标题
-// ----------------------------------------------------------------
-const RESULT_TYPE_LABELS = {
-  raster: '栅格结果',
-  csv: 'CSV 结果',
-  json: '结构化结果',
-  metrics: '指标结果',
-  gee_task: 'GEE 任务已提交'
-}
-
-const resultType = computed(() => props.result?.result_type || '')
-const hasMessage = computed(() => Boolean(props.result?.message))
-
-const resultTitle = computed(() => {
-  return RESULT_TYPE_LABELS[resultType.value] || '运行结果'
 })
 
 // ----------------------------------------------------------------
@@ -466,9 +468,41 @@ function makeFileRefs(file) {
   }
 }
 
-const rasters = computed(() => {
-  const files = props.result?.files || []
-  return files.filter((f) => TIF_RE.test(f.name)).map(makeFileRefs)
+// rasterGroups: 把 .tif 产物按 `group` 字段分组。
+//   - 一个 group 只有一个文件 → 普通单图，走 /result/files/{name}/preview.png
+//   - 一个 group 有多个文件 → 这些是「同一张图切开的分片」，只有拼起来才
+//     完整，走 /result/mosaic/* 由后端拼成一张图再展示（和展示页上传多张
+//     TIF 时用的是同一条拼接管线）。
+// `group` 字段缺省时每个文件自成一组，行为与以前完全一致。
+const rasterGroups = computed(() => {
+  const files = (props.result?.files || []).filter((f) => TIF_RE.test(f.name))
+  const bucket = new Map()
+  for (const f of files) {
+    const groupValue = f.group ?? ''
+    const key = groupValue ? `group:${groupValue}` : `file:${f.name}`
+    if (!bucket.has(key)) bucket.set(key, [])
+    bucket.get(key).push(f)
+  }
+  return [...bucket.entries()].map(([key, items]) => {
+    const refs = items.map(makeFileRefs)
+    const names = refs.map((r) => r.name)
+    const isMosaic = refs.length > 1
+    return {
+      key,
+      label: refs[0].label || '',
+      names,
+      files: refs,
+      isMosaic,
+      // 单图显示文件名；拼接图显示一个整体标题（label 徽章另外单独显示）
+      name: isMosaic ? `拼接结果（${refs.length} 个分片）` : names[0],
+      size_bytes: refs.reduce((sum, r) => sum + (Number(r.size_bytes) || 0), 0),
+      previewUrl: isMosaic
+        ? jobMosaicPreviewUrl(props.jobId, names)
+        : jobPreviewUrl(props.jobId, names[0]),
+      // 拼接图没有单一的 TIF 可下载，只有分片
+      downloadUrl: isMosaic ? '' : jobFileUrl(props.jobId, names[0]),
+    }
+  })
 })
 
 const imageFiles = computed(() => {
@@ -503,14 +537,17 @@ const otherFiles = computed(() => {
 })
 
 // ----------------------------------------------------------------
-// ③.b 每个 raster 的 info（驱动色带图例 + 统计表）
+// ③.b 每个栅格组的 info（驱动色带图例 + 统计表）
 // ----------------------------------------------------------------
-// infoMap: { filename -> info payload from /api/jobs/{id}/result/files/{name}/info }
+// infoMap: { groupKey -> info payload }
+//   单图组 → /api/jobs/{id}/result/files/{name}/info
+//   拼接组 → /api/jobs/{id}/result/mosaic/info?files=a.tif,b.tif
 const infoMap = reactive({})
 const infoErrors = reactive({})
 
 async function loadRasterInfos() {
-  const wanted = new Set(rasters.value.map((r) => r.name))
+  const groups = rasterGroups.value
+  const wanted = new Set(groups.map((g) => g.key))
   // 删掉已不存在的 key
   for (const k of Object.keys(infoMap)) {
     if (!wanted.has(k)) {
@@ -518,14 +555,18 @@ async function loadRasterInfos() {
       delete infoErrors[k]
     }
   }
-  // 并发 fetch 新出现的文件
+  // 并发 fetch 新出现的组
   const tasks = [...wanted]
-    .filter((name) => !(name in infoMap) && !infoErrors[name])
-    .map(async (name) => {
+    .filter((key) => !(key in infoMap) && !infoErrors[key])
+    .map(async (key) => {
+      const group = groups.find((g) => g.key === key)
+      if (!group) return
       try {
-        infoMap[name] = await fetchJobInfo(props.jobId, name)
+        infoMap[key] = group.isMosaic
+          ? await fetchJobMosaicInfo(props.jobId, group.names)
+          : await fetchJobInfo(props.jobId, group.names[0])
       } catch (err) {
-        infoErrors[name] = err?.message || '加载失败'
+        infoErrors[key] = err?.message || '加载失败'
       }
     })
   await Promise.all(tasks)
@@ -686,14 +727,15 @@ function typeLabelOf(t) {
   return t || '?'
 }
 
-// 图例标题：根据文件名启发式推断
-function legendTitleFor(filename) {
-  const lower = filename.toLowerCase()
-  if (lower.includes('yield') || lower.includes('产量')) return '产量等级'
-  if (lower.includes('ndvi') || lower.includes('长势') || lower.includes('growth')) return '长势等级'
-  if (lower.includes('disease') || lower.includes('病虫')) return '病虫害等级'
-  if (lower.includes('final')) return '最终结果'
-  if (lower.includes('raw')) return '原始数据'
+// 图例标题：根据文件名启发式推断。拼接组用所有分片名一起判断。
+function legendTitleFor(group) {
+  const text = (group.names || [group.name]).join(' ').toLowerCase()
+  if (text.includes('yield') || text.includes('产量')) return '产量等级'
+  if (text.includes('ndvi') || text.includes('长势') || text.includes('growth')) return '长势等级'
+  if (text.includes('disease') || text.includes('病虫')) return '病虫害等级'
+  if (text.includes('class')) return '分类结果'
+  if (text.includes('final')) return '最终结果'
+  if (text.includes('raw')) return '原始数据'
   return '数值分布'
 }
 
@@ -709,8 +751,7 @@ function binaryCountFor(info, cls) {
 // "10=甘蔗 / 20=水稻"），缺则回退到 `类别 N` 占位文案。
 // class_metadata 是 JSON 对象，键在传输过程中会被强制转成字符串，
 // 这里同时匹配 number 和 string 形态。
-function categoricalLabelFor(filename, cls) {
-  const info = infoMap[filename]
+function categoricalLabelFor(info, cls) {
   if (!info) return `类别 ${cls}`
   const meta = info.class_metadata
   if (meta && typeof meta === 'object') {
@@ -738,11 +779,18 @@ const rerunPath = computed(() => {
 const isEmpty = computed(() =>
   cards.value.length === 0 &&
   tables.value.length === 0 &&
-  rasters.value.length === 0 &&
+  rasterGroups.value.length === 0 &&
   imageFiles.value.length === 0 &&
   otherFiles.value.length === 0 &&
-  csvPreviews.value.length === 0 &&
-  !hasMessage.value
+  csvPreviews.value.length === 0
+)
+
+// 兜底文案要区分"跑完了但没结果"和"跑挂了" —— 之前只有 message 的失败任务
+// 会走 hasMessage 分支显示消息，现在消息挪到任务信息卡，这里必须自己说清楚。
+const emptyHint = computed(() =>
+  props.result?.status === 'failed'
+    ? '任务失败，没有返回结构化结果。'
+    : '任务已完成，但未返回任何结构化结果。'
 )
 
 // ----------------------------------------------------------------
@@ -813,7 +861,8 @@ const lightbox = reactive({
   index: 0,
 })
 
-const ALL_PREVIEW_FILES = computed(() => [...rasters.value, ...imageFiles.value])
+// 可大图预览的条目：每个栅格组（拼接组展示的是拼好的整图）+ 算法直接产出的图像
+const ALL_PREVIEW_FILES = computed(() => [...rasterGroups.value, ...imageFiles.value])
 
 function findPreviewList(target) {
   // 用户传入的就是单个对象时，从全局可预览列表里找出上下文；传入列表则直接用。
@@ -889,7 +938,7 @@ onBeforeUnmount(() => {
 
 // 当 result/files 变更时重新 fetch info
 watch(
-  () => rasters.value.map((r) => r.name).join('|'),
+  () => rasterGroups.value.map((g) => g.key).join('|'),
   () => { loadRasterInfos() },
   { immediate: true }
 )
@@ -904,9 +953,13 @@ watch(
 watch(
   () => props.result?.files,
   () => {
-    const names = new Set((props.result?.files || []).map((f) => f.name))
+    // imgError 的 key：栅格组用 group key，算法图像用文件名
+    const keys = new Set([
+      ...rasterGroups.value.map((g) => g.key),
+      ...imageFiles.value.map((f) => f.name),
+    ])
     for (const key of Object.keys(imgError)) {
-      if (!names.has(key)) delete imgError[key]
+      if (!keys.has(key)) delete imgError[key]
     }
   },
   { deep: true }
@@ -917,20 +970,6 @@ onMounted(loadCsvPreviews)
 </script>
 
 <style scoped>
-.result-renderer__header {
-  margin-bottom: 12px;
-}
-.result-renderer__title {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--color-text);
-}
-.result-renderer__subtitle {
-  margin: 4px 0 0 0;
-  font-size: 13px;
-  color: var(--color-muted);
-}
 .result-renderer__empty {
   color: var(--color-muted);
   padding: 12px 0;
@@ -1094,6 +1133,33 @@ onMounted(loadCsvPreviews)
 .raster-card__size {
   color: var(--color-muted);
   font-size: 12px;
+}
+/* 多分片拼接组：标题上的「N 个分片」标记 */
+.raster-card__shards {
+  color: #1e40af;
+  background: #dbeafe;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+/* 分片列表：逐个列出可下载的分片 TIF */
+.raster-card__shard-list {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #fff;
+  border-bottom: 1px solid var(--color-border);
+  font-size: 12px;
+}
+.raster-card__shard-list-title {
+  color: var(--color-muted);
+}
+.raster-card__shard {
+  color: var(--color-primary);
+  word-break: break-all;
 }
 .raster-card__actions {
   display: inline-flex;

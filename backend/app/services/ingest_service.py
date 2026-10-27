@@ -50,7 +50,7 @@ needs a hosted URL (GCS / HTTP), and we don't have a GCS bucket.
 Workaround for CSV / GeoJSON sources: split the FC dict client-side
 into chunks whose serialized JSON is ≤ 9 MB, upload each to a throw-
 away temp asset, wait for all of them to land, then merge them
-server-side via ``ee.FeatureCollection([c1, c2, …]).flatten()`` and
+server-side via :func:`fc_from_asset_ids` and
 re-export to the final asset id. The merge manifest only references
 asset ids, so it never hits the 10 MB request cap. Intermediate
 chunk assets are deleted best-effort afterwards to free storage.
@@ -517,6 +517,7 @@ def _ingest_vector_via_geemap(
     asset_id: str,
     local_path: Path,
     kind: str,
+    project: Optional[str] = None,
 ) -> List[str]:
     """Build an ee.FeatureCollection from a local vector file and export
     it to GEE asset(s) via ``ee.batch.Export.table.toAsset``.
@@ -688,7 +689,7 @@ def _ingest_vector_via_geemap(
             # failure; the algorithm-level error label still reads
             # "上传到 GEE 失败：<reason>".
             for ca in chunk_asset_ids:
-                _wait_for_asset(ca, timeout=600.0)
+                _wait_for_asset(ca, timeout=600.0, project=project)
             print(f"[ingest] 分块上传全部完成：{len(chunk_asset_ids)} chunks")
             return chunk_asset_ids
     else:
@@ -707,7 +708,7 @@ def _ingest_vector_via_geemap(
         return [asset_id]
 
 
-def _wait_for_asset(asset_id: str, *, timeout: float = 240.0) -> None:
+def _wait_for_asset(asset_id: str, *, timeout: float = 240.0, project: Optional[str] = None) -> None:
     """Block until the ingested asset is queryable.
 
     We poll by trying `ee.data.getAsset(asset_id)` — the asset only becomes
@@ -725,8 +726,22 @@ def _wait_for_asset(asset_id: str, *, timeout: float = 240.0) -> None:
             ee.data.getAsset(asset_id)
             return  # success
         except Exception as exc:  # noqa: BLE001
+            # A permission error is not "asset not ready yet" — it will
+            # never become ready under these credentials, so retrying for
+            # the full timeout and then reporting "上传超时" sends the user
+            # down the wrong path entirely. Bail out immediately with the
+            # actionable re-authenticate prompt instead.
+            if project:
+                from app.services.gee_auth import raise_if_auth_mismatch
+
+                raise_if_auth_mismatch(exc, project)
             last_err = exc
-            time.sleep(_POLL_INTERVAL)
+            # 这段等待没有请求要发出去，让出进程级 GEE 锁给别的任务，
+            # 否则一次上传会把同一进程里其它 GEE 任务堵在提交阶段。
+            from app.services.gee_auth import gee_idle
+
+            with gee_idle():
+                time.sleep(_POLL_INTERVAL)
     raise TimeoutError(
         f"GEE 资产上传超时（>{int(timeout)}s）：{asset_id}; last={last_err}"
     )
@@ -750,10 +765,16 @@ def ensure_asset_for_local(
     - Single-element ``[asset_id]`` for small files / SHP that fit
       inside GEE's 10 MB ``Export.table.toAsset`` cap.
     - Multi-element list of ``<asset_id>_chunkNNN`` ids for CSV / GeoJSON
-      that had to be chunked. **The caller must flatten them server-side
+      that had to be chunked. **The caller must merge them server-side
       at use time**:
 
-          ee.FeatureCollection(asset_ids).flatten()
+          from app.services.ingest_service import fc_from_asset_ids
+          fc = fc_from_asset_ids(asset_ids)
+
+      Do NOT write ``ee.FeatureCollection(asset_ids).flatten()``: that is the
+      JavaScript idiom and raises ``Invalid GeoJSON geometry.`` in the Python
+      API (the id strings get parsed as geometries, client-side). Use
+      :func:`fc_from_asset_ids`, which handles the single-id case too.
 
       GEE's ``Export.table.toAsset`` request body has a hard 10 MB cap
       and we cannot merge them back into a single asset client-side (that
@@ -828,12 +849,14 @@ def ensure_asset_for_local(
     asset_id = _make_asset_name(algorithm, slot, project)
 
     print(f"[ingest] 注册本地研究区 → base={asset_id} (kind={kind})")
-    asset_ids = _ingest_vector_via_geemap(asset_id=asset_id, local_path=src, kind=kind)
+    asset_ids = _ingest_vector_via_geemap(
+        asset_id=asset_id, local_path=src, kind=kind, project=project
+    )
     # Wait for all uploaded chunks (single upload → [asset_id], chunked →
     # multiple). If any times out the existing TimeoutError surfaces as
     # "上传到 GEE 失败" in the algorithm-level error label.
     for aid in asset_ids:
-        _wait_for_asset(aid, timeout=600.0)
+        _wait_for_asset(aid, timeout=600.0, project=project)
 
     cache[file_id] = {
         "asset_ids": list(asset_ids),
@@ -850,4 +873,65 @@ def ensure_asset_for_local(
     return list(asset_ids)
 
 
-__all__ = ["ensure_asset_for_local"]
+# ---- Python API 安全的 FeatureCollection 构造 -------------------------------
+
+
+def fc_from_asset_ids(asset_ids: List[str]) -> Any:
+    """Build an ``ee.FeatureCollection`` from one or more Table asset ids.
+
+    ``ensure_asset_for_local`` returns a list: one id for a plain upload / SHP,
+    ``N`` ids when the payload was chunked to dodge GEE's 10 MB export cap.
+    Callers must turn that list into a single FC — **but not** with the
+    JavaScript idiom ``ee.FeatureCollection(ids)``.
+
+    Why it matters
+    --------------
+    In JS, ``ee.FeatureCollection(['id1', 'id2'])`` is valid. The Python API
+    is different: ``ee.FeatureCollection(<list>)`` takes the *list-of-features*
+    branch (``featurecollection.py``: ``[feature.Feature(i) for i in args]``),
+    so each element is wrapped in ``ee.Feature`` → ``ee.Geometry``. Handing it
+    an asset-id *string* makes the client try to parse
+    ``"projects/<p>/assets/<name>"`` as GeoJSON geometry and raise::
+
+        ee.ee_exception.EEException: Invalid GeoJSON geometry.
+
+    That happens entirely client-side — no request ever reaches GEE — and it
+    fires for a single id just as much as for several, so "填 GEE Asset ID" and
+    the chunked-upload path were both broken. Passing the id as a bare string
+    is the supported single-table form; for several ids each must be loaded
+    into its own ``ee.FeatureCollection`` before combining.
+
+    Args
+    ----
+    asset_ids:
+        One or more full GEE Table asset ids. Empty / blank entries are
+        ignored so callers can pass a filtered list without pre-cleaning it.
+
+    Returns
+    -------
+    ee.FeatureCollection
+        Union of all the referenced tables.
+
+    Raises
+    ------
+    ValueError
+        If ``asset_ids`` contains no usable id (e.g. all ``None``/blank).
+    """
+    import ee
+
+    ids = [str(i).strip() for i in (asset_ids or []) if i and str(i).strip()]
+    if not ids:
+        raise ValueError(
+            "没有可用的 GEE Asset ID —— 请先上传研究区 / 特征文件，"
+            "或在参数中填写形如 projects/<project>/assets/<name> 的资产路径。"
+        )
+    if len(ids) == 1:
+        # String form == "load this table". No flatten() needed (a
+        # single-element list would hit the Invalid-GeoJSON branch above).
+        return ee.FeatureCollection(ids[0])
+    return ee.FeatureCollection(
+        [ee.FeatureCollection(i) for i in ids]
+    ).flatten()
+
+
+__all__ = ["ensure_asset_for_local", "fc_from_asset_ids"]

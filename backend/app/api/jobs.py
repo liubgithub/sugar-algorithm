@@ -8,6 +8,7 @@ from app.schemas.job import (
     JobCreateRequest,
     JobCreateResponse,
     JobPatchRequest,
+    JobRetryResponse,
     JobStatusResponse,
 )
 from app.services import job_service
@@ -94,6 +95,28 @@ def cancel_job(job_id: str) -> JobCancelResponse:
             detail=f"job '{job_id}' is '{new_status}', only queued jobs can be cancelled",
         )
     return JobCancelResponse(job_id=job_id, status="cancelled")
+
+
+@router.post("/{job_id}/retry", response_model=JobRetryResponse)
+def retry_job(job_id: str) -> JobRetryResponse:
+    """重新拉取一个失败 / 已取消任务的结果。
+
+    典型场景：GEE 侧的任务早就跑完了，挂在**最后一步**（等 Asset + 下载
+    GeoTIFF）失败 —— 通常是本机代理抽风。GEE 里的结果还在，重试即可
+    重新下载；已经下载过的图块会断点续传，不用从头再来。
+    """
+    try:
+        new_status = job_service.retry_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if new_status is None:
+        raise HTTPException(status_code=404, detail=f"job '{job_id}' not found")
+    job = job_service.get_job(job_id) or {}
+    return JobRetryResponse(
+        job_id=job_id,
+        status=new_status,
+        message=job.get("message", ""),
+    )
 
 
 @router.get("/{job_id}/log")

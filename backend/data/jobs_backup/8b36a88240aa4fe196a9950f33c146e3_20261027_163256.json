@@ -1,0 +1,113 @@
+{
+  "status": "completed",
+  "result_type": "raster",
+  "files": [
+    {
+      "name": "Harvest_2025_20260421.tif",
+      "label": "harvest_mask",
+      "path": "D:\\postgraduate_0\\algorithm_review\\item\\backend\\data\\jobs\\8b36a88240aa4fe196a9950f33c146e3\\Harvest_2025_20260421.tif",
+      "size_bytes": 44716336
+    }
+  ],
+  "metrics": {
+    "year": 2025,
+    "base_window": "2025-10-01 → 2025-11-30",
+    "current_window": "2025-12-01 → 2026-04-21",
+    "gee_task_id": "6TEALLAUFE7Z5KOH5LFOHVJ7",
+    "asset_id": "projects/guangxi-try/assets/Harvest_2025_20260421",
+    "description": "Harvest_2025_20260421",
+    "mask_source": "gee_asset",
+    "mask_source_label": "projects/guangxi-try/assets/sugercane_class_089",
+    "rvi_absolute_low": 0.6,
+    "rvi_drop_min": 0.2,
+    "scale": 10,
+    "crs": "EPSG:4326",
+    "max_pixels": 10000000000000,
+    "cards": [
+      {
+        "key": "task_status",
+        "label": "任务状态",
+        "value": "完成",
+        "unit": ""
+      },
+      {
+        "key": "year",
+        "label": "目标年份",
+        "value": 2025,
+        "unit": "年"
+      },
+      {
+        "key": "base_window",
+        "label": "基期窗口",
+        "value": "2025-10-01 → 2025-11-30",
+        "unit": ""
+      },
+      {
+        "key": "current_window",
+        "label": "监测期窗口",
+        "value": "2025-12-01 → 2026-04-21",
+        "unit": ""
+      },
+      {
+        "key": "rvi_low",
+        "label": "RVI 绝对下限",
+        "value": 0.6,
+        "unit": ""
+      },
+      {
+        "key": "rvi_drop",
+        "label": "RVI 下降阈值",
+        "value": 0.2,
+        "unit": ""
+      },
+      {
+        "key": "scale",
+        "label": "导出分辨率",
+        "value": 10,
+        "unit": "m"
+      },
+      {
+        "key": "mask_source",
+        "label": "掩膜来源",
+        "value": "gee_asset",
+        "unit": ""
+      },
+      {
+        "key": "gee_task_id",
+        "label": "GEE 任务 ID",
+        "value": "6TEALLAUFE7Z5KOH5LFOHVJ7",
+        "unit": ""
+      },
+      {
+        "key": "asset_id",
+        "label": "GEE 资产",
+        "value": "projects/guangxi-try/assets/Harvest_2025_20260421",
+        "unit": ""
+      },
+      {
+        "key": "raster_size",
+        "label": "栅格尺寸",
+        "value": "84720 × 59251",
+        "unit": "px"
+      },
+      {
+        "key": "output_tif",
+        "label": "输出文件",
+        "value": "Harvest_2025_20260421.tif",
+        "unit": ""
+      },
+      {
+        "key": "file_size",
+        "label": "文件大小",
+        "value": "42.6",
+        "unit": "MB"
+      }
+    ],
+    "raster_width": 84720,
+    "raster_height": 59251,
+    "raster_crs": "EPSG:4326",
+    "tile_count": 315
+  },
+  "gee_task_id": null,
+  "message": "GEE 收割监测完成（task_id=6TEALLAUFE7Z5KOH5LFOHVJ7，asset=projects/guangxi-try/assets/Harvest_2025_20260421，年份=2025，输出 Harvest_2025_20260421.tif 84720×59251，42.6 MB）"
+}

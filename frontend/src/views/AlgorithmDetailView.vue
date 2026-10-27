@@ -159,7 +159,7 @@
             step="any"
             inputmode="decimal"
             v-model.number="params[field.key]"
-            :placeholder="field.default ?? ''"
+            :placeholder="field.placeholder ?? field.default ?? ''"
           />
 
           <!-- Date field -->
@@ -168,7 +168,7 @@
             class="input"
             type="date"
             v-model="params[field.key]"
-            :placeholder="field.default ?? ''"
+            :placeholder="field.placeholder ?? field.default ?? ''"
           />
 
           <!-- Text / textarea -->
@@ -177,13 +177,13 @@
             class="input"
             type="text"
             v-model="params[field.key]"
-            :placeholder="field.default ?? ''"
+            :placeholder="field.placeholder ?? field.default ?? ''"
           />
           <textarea
             v-else
             class="textarea"
             v-model="params[field.key]"
-            :placeholder="field.default ?? ''"
+            :placeholder="field.placeholder ?? field.default ?? ''"
           />
 
           <p v-if="field.hint" class="form-row__hint">{{ field.hint }}</p>
@@ -324,27 +324,27 @@
                 step="any"
                 inputmode="decimal"
                 v-model.number="params[field.key]"
-                :placeholder="field.default ?? ''"
+                :placeholder="field.placeholder ?? field.default ?? ''"
               />
               <input
                 v-else-if="field.type === 'date'"
                 class="input"
                 type="date"
                 v-model="params[field.key]"
-                :placeholder="field.default ?? ''"
+                :placeholder="field.placeholder ?? field.default ?? ''"
               />
               <input
                 v-else-if="field.type !== 'textarea'"
                 class="input"
                 type="text"
                 v-model="params[field.key]"
-                :placeholder="field.default ?? ''"
+                :placeholder="field.placeholder ?? field.default ?? ''"
               />
               <textarea
                 v-else
                 class="textarea"
                 v-model="params[field.key]"
-                :placeholder="field.default ?? ''"
+                :placeholder="field.placeholder ?? field.default ?? ''"
               />
 
               <p v-if="field.hint" class="form-row__hint">{{ field.hint }}</p>
@@ -356,7 +356,11 @@
         <button class="button" :disabled="submitting || hasUploading">
           {{ submitting ? '提交中…' : (hasUploading ? '上传中…' : '提交运行') }}
         </button>
-        <p v-if="submitError" style="color: var(--color-danger); margin-top: 12px;">
+        <!-- 提交失败提示。GEE 认证不匹配时后端返回的文案是 GeeAuthRequired 的
+             str()（以固定前缀开头），必须走 GeeAuthHint 渲染 —— 纯红字没法
+             承载多行命令，用户只能自己从长句里抠出该敲哪条命令。 -->
+        <GeeAuthHint v-if="submitError && isGeeAuthSubmitError" :message="submitError" />
+        <p v-else-if="submitError" style="color: var(--color-danger); margin-top: 12px;">
           {{ submitError }}
         </p>
       </form>
@@ -375,7 +379,9 @@ import {
 } from '../api/gee'
 import { createJob } from '../api/jobs'
 import { uploadAsset } from '../api/uploads'
+import GeeAuthHint from '../components/GeeAuthHint.vue'
 import { useDatasetsStore } from '../stores/datasets'
+import { isGeeAuthMessage } from '../utils/geeAuth'
 
 const route = useRoute()
 const router = useRouter()
@@ -390,6 +396,12 @@ const groupValues = reactive({})   // field key -> current group_value text
 const selectedHistoryId = reactive({}) // field key -> picked history file_id
 const submitting = ref(false)
 const submitError = ref('')
+// submitError 是否来自 GEE 认证不匹配。verify 接口用 `code` 字段显式标记，
+// 其余失败路径（必填校验、后端 500）一律 false，走纯红字渲染。
+const submitErrorIsGeeAuth = ref(false)
+const isGeeAuthSubmitError = computed(
+  () => submitErrorIsGeeAuth.value || isGeeAuthMessage(submitError.value)
+)
 
 // ----------------------------------------------------------------------
 // Saved GEE Assets — locally-persisted Asset pointers the user can
@@ -820,6 +832,7 @@ function validateCropFeatures() {
 
 async function onSubmit() {
   submitError.value = ''
+  submitErrorIsGeeAuth.value = false
   // notice 字段不参与必填检查（它只是展示给用户的提醒），其它必填字段必须填写。
   const missing = (algo.value?.params_schema || [])
     .filter((f) => f.required && f.type !== 'notice' && (params[f.key] === '' || params[f.key] == null))
@@ -849,6 +862,10 @@ async function onSubmit() {
       )
       if (verifyResult && verifyResult.ok === false) {
         submitError.value = verifyResult.error || 'GEE Asset 校验失败'
+        // 后端已在 error 文案里给出 GeeAuthRequired 原文（见 gee_auth.py），
+        // 这里只记一个布尔量供模板决定渲染分支，不再另外拼文案 —— 两处
+        // 文案各自演化的话，前端的识别规则迟早会对不上。
+        submitErrorIsGeeAuth.value = verifyResult.code === 'gee_auth_required'
         return
       }
     } catch (_) {

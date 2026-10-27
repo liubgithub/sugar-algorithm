@@ -1,0 +1,77 @@
+{
+  "job_id": "595bc31b8ace42e28e3b251c386c11f4",
+  "filename": "CROPClassification_2025_20261022174308.tif",
+  "filenames": [
+    "CROPClassification_2025_20261022174308.tif"
+  ],
+  "mosaic": false,
+  "mosaic_count": 1,
+  "schema_version": 8,
+  "source_signature": [
+    [
+      1793085788965228100,
+      383949993,
+      1793088867581984400,
+      361
+    ]
+  ],
+  "type": "categorical",
+  "width": 84718,
+  "height": 61073,
+  "preview_width": 1024,
+  "preview_height": 738,
+  "bounds": [
+    [
+      104.44648926387788,
+      20.902269525478264
+    ],
+    [
+      112.05683668788164,
+      26.388550460181417
+    ]
+  ],
+  "stats": {
+    "class_counts": {
+      "10": 17483,
+      "20": 46411,
+      "30": 199245,
+      "40": 110284,
+      "50": 6230
+    },
+    "nodata_count": 376059
+  },
+  "classes": {
+    "10": "#FF0000",
+    "20": "#FFF9E6",
+    "30": "#D1FAE5",
+    "40": "#E0F2FE",
+    "50": "#94a3b8"
+  },
+  "class_metadata": {
+    "10": {
+      "color": "#FF0000",
+      "label": "甘蔗"
+    },
+    "20": {
+      "color": "#FFF9E6",
+      "label": "水稻"
+    },
+    "30": {
+      "color": "#D1FAE5",
+      "label": "桉树"
+    },
+    "40": {
+      "color": "#E0F2FE",
+      "label": "其他作物"
+    },
+    "50": {
+      "color": "#94a3b8",
+      "label": "背景"
+    }
+  },
+  "cmap": null,
+  "nodata": 0.0,
+  "effective_pixel_ratio": 0.5023778899898373,
+  "effective_pixel_count": 379653,
+  "total_pixel_count": 755712
+}

@@ -22,16 +22,27 @@ Result (job.result) shape mirrors ``crop_features`` Pattern B:
     {
       "status": "submitted" → "completed",
       "result_type": "gee_task" → "raster",
-      "files": [{"name": "<description>.tif", "label": "classification", ...}],
+      "files": [
+        {"name": "<description>_part01.tif", "label": "classification",
+         "group": "classification", ...},
+        {"name": "<description>_part02.tif", "label": "classification",
+         "group": "classification", ...}
+      ],
       "metrics": {
         "year": ...,
         "oa": ..., "kappa": ..., "confusion_matrix": [[...], ...],
         "num_trees": ..., "train_ratio": ...,
         "asset_id": ..., "output_tif_name": ...,
+        "shard_count": ..., "shard_names": [...],
         "gee_task_id": ...,
         "cards": [{key, label, value, unit}, ...]
       }
     }
+
+The result is cut into several independent GeoTIFFs (see
+``configs.DEFAULT_SHARD_COUNT``).  Files that share a ``group`` are shards of
+one map: the result page stitches them back together for the preview, while
+each shard stays downloadable on its own.
 """
 from __future__ import annotations
 
@@ -58,10 +69,15 @@ class CropClassificationAdapter(AlgorithmAdapter):
             "label": "GEE 项目 ID",
             "type": "text",
             "required": True,
-            "default": "sodium-ray-505904-i3",
+            # 刻意留空，不要预填任何具体项目。ee 的项目绑定是进程全局的，
+            # 预填值会在表单一加载、用户还没点运行时就把整个后端的 EE 切走，
+            # 污染同一进程里其它算法 / 其它任务的请求。
+            "default": "",
+            "placeholder": "例如：my-gee-project-123456",
             "hint": (
-                "用于 ee.Initialize(project=...)。"
-                "如需切换项目，请同时在本机执行 earthengine authenticate --force。"
+                "用于 ee.Initialize(project=...)，当前 GEE 账号必须对该项目有访问权限。"
+                "如需切换项目，请先在本机执行 earthengine authenticate --force，"
+                "再回来填这里的新项目 ID。"
             ),
         },
         {
@@ -83,11 +99,8 @@ class CropClassificationAdapter(AlgorithmAdapter):
             "required": False,
             "hint": (
                 "首次运行需上传本地研究区矢量（Shapefile 至少需要 .shp + .shx + .dbf "
-                "三件套，请全部打包为 .zip；GeoJSON 也可直接上传）。"
-                "后端会自动把首个矢量注册为 GEE Asset 并保存到「已保存 GEE Assets」。"
-                "后续运行可直接从历史文件下拉框中选择，或在下方直接填写 GEE Asset ID。"
-                "栅格研究区（.tif）请改用下方『研究区 GEE Asset ID』字段，"
-                "在 GEE Code Editor 上传后填入。"
+                "三件套，请全部打包为 .zip"
+                
             ),
             "xors_with": ["roi_asset_id"],
         },
@@ -99,8 +112,7 @@ class CropClassificationAdapter(AlgorithmAdapter):
             "default": "",
             "hint": (
                 "格式：projects/<project>/assets/<name>。"
-                "填写后将跳过本地上传，直接复用此 Asset；"
-                "提交后会做一次存在/可访问性校验。"
+                "填写后将跳过本地上传"
             ),
             "xors_with": ["roi_local_path"],
             "saved_picker": {
@@ -121,11 +133,7 @@ class CropClassificationAdapter(AlgorithmAdapter):
             "slot": "samples",
             "required": False,
             "hint": (
-                "特征文件应为特征生成算法生成的样本特征文件，"
-                "首次运行需上传本地 CSV（含 longitude / latitude 与 class 列）或 GeoJSON。"
-                "CSV 格式：UTF-8 编码、首行为英文表头、必须包含 longitude 与 latitude 列。"
-                "后端会自动把首个矢量注册为 GEE Asset 并保存到「已保存 GEE Assets」。"
-                "后续运行可直接从历史文件下拉框中选择，或在下方直接填写 GEE Asset ID。"
+                "特征文件应为特征生成算法生成的样本特征文件"
             ),
             "xors_with": ["samples_asset_id"],
         },
@@ -136,10 +144,8 @@ class CropClassificationAdapter(AlgorithmAdapter):
             "required": False,
             "default": "",
             "hint": (
-                "格式：projects/<project>/assets/<name>。"
-                "特征文件应为特征生成算法（time-series-features）输出的样本 FeatureCollection，"
-                "必须含 class 列。填写后将跳过本地上传，直接复用此 Asset；"
-                "提交后会做一次存在/可访问性校验。"
+                "格式：projects/<project>/assets/<name>,"
+               " 填写后将跳过本地上传"
             ),
             "xors_with": ["samples_local_path"],
             "saved_picker": {
@@ -151,25 +157,25 @@ class CropClassificationAdapter(AlgorithmAdapter):
             },
         },
         # ===== 四、固定参数（仅展示，不可修改）=====
-        {
-            "key": "__fixed_params_notice__",
-            "type": "notice",
-            "notice_type": "info",
-            "notice_icon": "ℹ️",
-            "label": "固定参数（仅展示，不可修改）",
-            "hint": (
-                f"本算法共输出 {cfg.TOTAL_FEATURE_COUNT} 个特征"
-                f"（{cfg.FEATURE_BAND_COUNT} 个波段 × {cfg.TIME_SERIES_MONTHS} 个月 "
-                f"+ 1 个 DEM 高程）。\n"
-                f"min_values 长度 = {len(cfg.MIN_VALUES)}；"
-                f"max_values 长度 = {len(cfg.MAX_VALUES)}；"
-                f"DEM 归一化区间 [{cfg.DEM_MIN}, {cfg.DEM_MAX}]；"
-                f"Sentinel-2 最大云量 ≤ {cfg.CLOUD_PCT_MAX}%；"
-                f"RandomForest 树数 = {cfg.NUM_TREES}；"
-                f"训练集比例 = {int(cfg.TRAIN_RATIO * 100)}%。\n"
-                "以上参数由算法内置，禁止用户修改；如需调整请修改 configs.py。"
-            ),
-        },
+        # {
+        #     "key": "__fixed_params_notice__",
+        #     "type": "notice",
+        #     "notice_type": "info",
+        #     "notice_icon": "ℹ️",
+        #     "label": "固定参数（仅展示，不可修改）",
+        #     "hint": (
+        #         f"本算法共输出 {cfg.TOTAL_FEATURE_COUNT} 个特征"
+        #         f"（{cfg.FEATURE_BAND_COUNT} 个波段 × {cfg.TIME_SERIES_MONTHS} 个月 "
+        #         f"+ 1 个 DEM 高程）。\n"
+        #         f"min_values 长度 = {len(cfg.MIN_VALUES)}；"
+        #         f"max_values 长度 = {len(cfg.MAX_VALUES)}；"
+        #         f"DEM 归一化区间 [{cfg.DEM_MIN}, {cfg.DEM_MAX}]；"
+        #         f"Sentinel-2 最大云量 ≤ {cfg.CLOUD_PCT_MAX}%；"
+        #         f"RandomForest 树数 = {cfg.NUM_TREES}；"
+        #         f"训练集比例 = {int(cfg.TRAIN_RATIO * 100)}%。\n"
+        #         "以上参数由算法内置，禁止用户修改；如需调整请修改 configs.py。"
+        #     ),
+        # },
         # ===== 五、高级参数（默认折叠）=====
         {
             "key": "task_name",
@@ -219,6 +225,20 @@ class CropClassificationAdapter(AlgorithmAdapter):
             "default": cfg.CLOUD_PCT_MAX,
             "advanced": True,
             "hint": "CLOUDY_PIXEL_PERCENTAGE 阈值，0-100 之间。",
+        },
+        {
+            "key": "shard_count",
+            "label": "结果分片数",
+            "type": "number",
+            "required": False,
+            "default": cfg.DEFAULT_SHARD_COUNT,
+            "advanced": True,
+            "hint": (
+                "把分类结果切成几个独立的 GeoTIFF（默认 "
+                f"{cfg.DEFAULT_SHARD_COUNT}）。每个分片都可以单独下载，"
+                "但只有拼接起来才是完整地图 —— 结果页会自动把它们拼成一张图展示。"
+                "设为 1 则输出单个 GeoTIFF。"
+            ),
         },
     ]
 

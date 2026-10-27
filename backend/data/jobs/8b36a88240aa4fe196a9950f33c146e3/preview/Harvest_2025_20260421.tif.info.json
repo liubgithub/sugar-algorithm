@@ -1,0 +1,49 @@
+{
+  "job_id": "8b36a88240aa4fe196a9950f33c146e3",
+  "filename": "Harvest_2025_20260421.tif",
+  "filenames": [
+    "Harvest_2025_20260421.tif"
+  ],
+  "mosaic": false,
+  "mosaic_count": 1,
+  "schema_version": 8,
+  "source_signature": [
+    [
+      1792900257631763800,
+      44716336,
+      0,
+      0
+    ]
+  ],
+  "type": "binary",
+  "width": 84720,
+  "height": 59251,
+  "preview_width": 1024,
+  "preview_height": 716,
+  "bounds": [
+    [
+      104.44639943234947,
+      21.068098526926725
+    ],
+    [
+      112.05692651941006,
+      26.390706416863303
+    ]
+  ],
+  "stats": {
+    "count_0": 0,
+    "count_1": 10938,
+    "total_valid": 10938,
+    "nodata_count": 722246
+  },
+  "classes": {
+    "0": "#ffffff",
+    "255": "#000000"
+  },
+  "class_metadata": null,
+  "cmap": null,
+  "nodata": 0.0,
+  "effective_pixel_ratio": 0.01491849249301676,
+  "effective_pixel_count": 10938,
+  "total_pixel_count": 733184
+}

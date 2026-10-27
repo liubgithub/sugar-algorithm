@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 import ee
 
 from app.algorithms.base import ProgressCallback, make_card, make_result
-from app.services.ingest_service import ensure_asset_for_local
+from app.services.ingest_service import ensure_asset_for_local, fc_from_asset_ids
 from app.services.gee_auth import GeeAuthRequired, is_auth_mismatch_error
 
 
@@ -93,10 +93,21 @@ def run(
 ) -> Dict[str, Any]:
     """Compute thresholds synchronously and return make_result(completed)."""
     project = (
-        params.get("gee_project")
+        params.get("gee_project_id")
+        or params.get("gee_project")
         or os.environ.get("EE_PROJECT")
-        or "sodium-ray-505904-i3"
     )
+    if not project:
+        # 不再兜底到某个历史项目：静默用一个用户没选过的项目发起 GEE 请求，
+        # 正是「报错里出现一个我没填过的项目名」这类问题的来源；宁可明确失败。
+        return make_result(
+            status="failed",
+            result_type="json",
+            message=(
+                "缺少 GEE 项目 ID：请在参数中填写 gee_project_id，"
+                "或设置环境变量 EE_PROJECT。"
+            ),
+        )
     try:
         # 函数在本模块里被定义为 ``__ee``（避免与本文件内的旧私有符号冲突），
         # 由于处于模块顶层（非类内部），双下划线前缀不会触发 Python 名称改写
@@ -114,7 +125,9 @@ def run(
     # 研究区 asset 解析：优先用用户手动填的 roi_asset_id；否则把本地文件
     # 自动 ingest 到 GEE，把返回的 asset id(s) 写回 params 后继续原计算逻辑。
     # 注：ensure_asset_for_local 现在返回 List[str]（chunked 上传场景下可能多元素），
-    # 我们存到 roi_asset_ids，并在构造 FeatureCollection 时用 .flatten() 合并。
+    # 我们存到 roi_asset_ids，并用 fc_from_asset_ids 合并（不能直接
+    # ee.FeatureCollection(list)，那是 JS 写法，Python API 会抛
+    # "Invalid GeoJSON geometry."）。
     if not params.get("roi_asset_id") and not params.get("roi_asset_ids") and params.get("roi_local_path"):
         if progress_callback:
             progress_callback(10, "正在把本地研究区注册为 GEE 资产…")
@@ -154,7 +167,7 @@ def run(
                 "或在高级参数中直接填写 GEE Asset 路径。"
             ),
         )
-    roi = ee.FeatureCollection(params["roi_asset_ids"]).flatten()
+    roi = fc_from_asset_ids(params["roi_asset_ids"])
     roi_bounds = roi.geometry().bounds()
 
     # 高级参数：默认值与原硬编码完全一致 → 用户不动时行为不变。

@@ -400,14 +400,6 @@ def run(
     cards: List[Dict[str, Any]] = [
         make_card("target_month", "目标月份", metrics["target_month"]),
         make_card("target_season", "目标榨季", metrics["target_season"], "年"),
-        make_card(
-            "run_mode",
-            "运行模式",
-            {"forecast": "外推", "with_target": "目标年入训"}.get(
-                spec.run_mode, spec.run_mode
-            ),
-            "",
-        ),
         make_card("train_n", "训练样本数", metrics["train_n"], "条"),
         make_card("target_n", "县级数量", metrics["target_n"], "个"),
         make_card("feature_count", "动态特征数", metrics["feature_count"], "个"),
@@ -415,12 +407,6 @@ def run(
             "model_feature_count",
             "模型特征数",
             metrics["model_feature_count"],
-            "个",
-        ),
-        make_card(
-            "interaction_feature_count",
-            "regime 交互项数",
-            metrics["interaction_feature_count"],
             "个",
         ),
         make_card("ridge_alpha", "Ridge α", metrics["ridge_alpha"], ""),
@@ -436,33 +422,25 @@ def run(
             metrics["final_result_scale"],
             "",
         ),
-        make_card("train_r2", "训练集 R²", train_metrics.get("R2"), ""),
-        make_card("train_mae", "训练集 MAE", train_metrics.get("MAE"), "分数"),
+        make_card("train_r2", "训练集 R²", train_metrics.get("R2")),
+        make_card("train_mae", "训练集 MAE", train_metrics.get("MAE")),
         make_card(
-            "train_rmse", "训练集 RMSE", train_metrics.get("RMSE"), "分数"
+            "train_rmse", "训练集 RMSE", train_metrics.get("RMSE")
         ),
         make_card(
             "province_folded_prediction_final",
             "省级折叠预测",
             metrics["province_folded_prediction_final"],
-            "分数",
         ),
         make_card(
             "folded_intercept_final",
             "折叠截距(final)",
             metrics["folded_intercept_final"],
-            "分数",
         ),
         make_card(
             "dynamic_param_count",
             "动态参数数",
             metrics["dynamic_param_count"],
-            "个",
-        ),
-        make_card(
-            "folded_history_count",
-            "折叠历史项数",
-            metrics["folded_history_count"],
             "个",
         ),
         make_card("valid_pixel_count", "有效像元数", valid_pixel_count, "个"),
