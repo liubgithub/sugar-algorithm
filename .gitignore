@@ -88,3 +88,11 @@ $RECYCLE.BIN/
 !backend/data/algorithm_data/**/**
 
 # 任务运行时的 stdout.log 在 jobs/ 目录下，已通过上面的 jobs 规则一并保留。
+
+# ---------- 大体积 GeoTIFF 任务产物（不入库） ----------
+# 任务输出 tif 单文件常 >100MB（实测有 366MB / 42MB 的），超过 GitHub 单文件 100MB
+# 限制会导致推送被拒。规则必须放在上面"显式保留"区块之后：gitignore 以最后一条
+# 匹配规则为准，这里的 *.tif 会覆盖上面的 ! 规则。
+# 注意：仅对未跟踪文件生效；已入库的历史 tif 不受影响（需要重新入库时用 git add -f）。
+backend/data/jobs/**/*.tif
+backend/data/jobs/**/*.tiff
