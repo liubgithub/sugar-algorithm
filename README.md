@@ -34,19 +34,3 @@ npm run dev
 
 
 
-## 预览
-## 首页
-![系统首页](images/首页.png)
-## 算法
-![算法](images/算法.png)
-## 我的数据
-![我的数据](images/我的数据.png)
-## 任务
-![任务](images/任务.png)
-![任务](images/任务详情1.png)
-![任务](images/任务详情2.png)
-![任务](images/任务详情3.png)
-## 展示1
-![展示1](images/展示1.png)
-## 展示2
-![展示2](images/展示2.png)
